@@ -271,12 +271,59 @@ impl CompletionMenu {
                     range = offset..offset;
                 }
 
-                editor.replace_text_in_range_silent(
-                    Some(editor.range_to_utf16(&range)),
-                    &new_text,
-                    window,
-                    cx,
-                );
+                let mut replacements = item
+                    .additional_text_edits
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .map(|edit| {
+                        (
+                            editor.text.position_to_offset(&edit.range.start)
+                                ..editor.text.position_to_offset(&edit.range.end),
+                            edit.new_text.clone(),
+                            false,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                replacements.push((range.clone(), new_text.clone(), true));
+                replacements.sort_by_key(|(range, _, _)| (range.start, range.end));
+                let valid = replacements.iter().all(|(range, _, _)| {
+                    range.start <= range.end && range.end <= editor.text.len()
+                }) && replacements
+                    .windows(2)
+                    .all(|pair| pair[0].0.end <= pair[1].0.start);
+                if valid {
+                    let shift_before_primary = replacements
+                        .iter()
+                        .filter(|(edit_range, _, primary)| {
+                            !primary && edit_range.end <= range.start
+                        })
+                        .map(|(edit_range, text, _)| {
+                            text.len() as isize - (edit_range.end - edit_range.start) as isize
+                        })
+                        .sum::<isize>();
+                    let cursor =
+                        (range.start + new_text.len()).saturating_add_signed(shift_before_primary);
+                    for (edit_range, text, _) in replacements.into_iter().rev() {
+                        editor.replace_text_in_range_silent(
+                            Some(editor.range_to_utf16(&edit_range)),
+                            &text,
+                            window,
+                            cx,
+                        );
+                    }
+                    let cursor = editor
+                        .text
+                        .offset_to_position(cursor.min(editor.text.len()));
+                    editor.set_cursor_position(cursor, window, cx);
+                } else {
+                    editor.replace_text_in_range_silent(
+                        Some(editor.range_to_utf16(&range)),
+                        &new_text,
+                        window,
+                        cx,
+                    );
+                }
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
