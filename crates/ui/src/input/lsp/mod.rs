@@ -11,6 +11,7 @@ mod definitions;
 mod document_colors;
 mod document_highlights;
 mod hover;
+mod inlay_hints;
 mod semantic_tokens;
 
 pub use code_actions::*;
@@ -19,6 +20,7 @@ pub use definitions::*;
 pub use document_colors::*;
 pub use document_highlights::*;
 pub use hover::*;
+pub use inlay_hints::*;
 pub use semantic_tokens::*;
 
 /// LSP ServerCapabilities
@@ -37,11 +39,15 @@ pub struct Lsp {
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
     /// The document highlight provider.
     pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
+    /// The viewport inlay-hint provider.
+    pub inlay_hint_provider: Option<Rc<dyn InlayHintProvider>>,
     /// The range semantic tokens provider.
     pub semantic_tokens_provider: Option<Rc<dyn DocumentRangeSemanticTokensProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<lsp_types::DocumentHighlight>,
+    inlay_hints: Vec<lsp_types::InlayHint>,
+    inlay_hint_range: Option<lsp_types::Range>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
@@ -49,6 +55,7 @@ pub struct Lsp {
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
+    _inlay_hint_task: Task<()>,
     _semantic_tokens_task: Task<()>,
 }
 
@@ -61,13 +68,17 @@ impl Default for Lsp {
             definition_provider: None,
             document_color_provider: None,
             document_highlight_provider: None,
+            inlay_hint_provider: None,
             semantic_tokens_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
+            inlay_hints: vec![],
+            inlay_hint_range: None,
             semantic_tokens: vec![],
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
+            _inlay_hint_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
         }
     }
@@ -81,6 +92,8 @@ impl Lsp {
         window: &mut Window,
         cx: &mut Context<InputState>,
     ) {
+        self.inlay_hint_range = None;
+        self.inlay_hints.clear();
         self.update_document_colors(text, window, cx);
         self.update_semantic_tokens(text, window, cx);
     }
@@ -89,10 +102,13 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
         self.document_highlights.clear();
+        self.inlay_hints.clear();
+        self.inlay_hint_range = None;
         self.semantic_tokens.clear();
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
+        self._inlay_hint_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
     }
 }

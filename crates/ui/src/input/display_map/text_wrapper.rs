@@ -1,9 +1,8 @@
-use std::ops::Range;
 use gpui::Half;
+use std::ops::Range;
 
 use gpui::{
-    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px,
-    size,
+    App, Font, LineFragment, Pixels, Point, ShapedLine, Size, TextAlign, Window, point, px, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
@@ -352,6 +351,63 @@ pub(crate) struct LineLayout {
     pub(crate) whitespace_indicators: Option<WhitespaceIndicators>,
     /// Whitespace indicators: (line_index, x_position, is_tab)
     pub(crate) whitespace_chars: Vec<(usize, Pixels, bool)>,
+    /// Maps each shaped visual line, which may contain non-editable injected
+    /// text, back to authoritative buffer byte offsets.
+    visual_mappings: SmallVec<[VisualLineMapping; 1]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InjectedTextSpan {
+    /// Byte offset in the visual line's real buffer text.
+    pub(crate) buffer_offset: usize,
+    /// Byte range occupied by the injected text in the shaped display text.
+    pub(crate) display_range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct VisualLineMapping {
+    pub(crate) buffer_len: usize,
+    pub(crate) injections: Vec<InjectedTextSpan>,
+}
+
+impl VisualLineMapping {
+    fn identity(buffer_len: usize) -> Self {
+        Self {
+            buffer_len,
+            injections: Vec::new(),
+        }
+    }
+
+    fn buffer_to_display(&self, offset: usize) -> usize {
+        let offset = offset.min(self.buffer_len);
+        offset
+            + self
+                .injections
+                .iter()
+                .filter(|injection| injection.buffer_offset < offset)
+                .map(|injection| injection.display_range.len())
+                .sum::<usize>()
+    }
+
+    fn display_to_buffer(&self, offset: usize) -> usize {
+        let mut injected_before = 0;
+        for injection in &self.injections {
+            if offset < injection.display_range.start {
+                break;
+            }
+            if offset <= injection.display_range.end {
+                return injection.buffer_offset.min(self.buffer_len);
+            }
+            injected_before += injection.display_range.len();
+        }
+        offset.saturating_sub(injected_before).min(self.buffer_len)
+    }
+
+    fn display_offset_is_injected(&self, offset: usize) -> bool {
+        self.injections
+            .iter()
+            .any(|injection| injection.display_range.contains(&offset))
+    }
 }
 
 impl LineLayout {
@@ -362,6 +418,7 @@ impl LineLayout {
             wrapped_lines: SmallVec::new(),
             whitespace_chars: Vec::new(),
             whitespace_indicators: None,
+            visual_mappings: SmallVec::new(),
         }
     }
 
@@ -371,7 +428,29 @@ impl LineLayout {
     }
 
     pub(crate) fn set_wrapped_lines(&mut self, wrapped_lines: SmallVec<[ShapedLine; 1]>) {
-        self.len = wrapped_lines.iter().map(|l| l.len).sum();
+        self.visual_mappings = wrapped_lines
+            .iter()
+            .map(|line| VisualLineMapping::identity(line.len))
+            .collect();
+        self.set_wrapped_lines_and_mappings(wrapped_lines, self.visual_mappings.clone());
+    }
+
+    pub(crate) fn lines_with_mappings(
+        mut self,
+        wrapped_lines: SmallVec<[ShapedLine; 1]>,
+        mappings: SmallVec<[VisualLineMapping; 1]>,
+    ) -> Self {
+        self.set_wrapped_lines_and_mappings(wrapped_lines, mappings);
+        self
+    }
+
+    fn set_wrapped_lines_and_mappings(
+        &mut self,
+        wrapped_lines: SmallVec<[ShapedLine; 1]>,
+        mappings: SmallVec<[VisualLineMapping; 1]>,
+    ) {
+        debug_assert_eq!(wrapped_lines.len(), mappings.len());
+        self.len = mappings.iter().map(|mapping| mapping.buffer_len).sum();
         let width = wrapped_lines
             .iter()
             .map(|l| l.width)
@@ -379,6 +458,7 @@ impl LineLayout {
             .unwrap_or_default();
         self.longest_width = width;
         self.wrapped_lines = wrapped_lines;
+        self.visual_mappings = mappings;
     }
 
     pub(crate) fn with_whitespaces(mut self, indicators: Option<WhitespaceIndicators>) -> Self {
@@ -390,7 +470,11 @@ impl LineLayout {
         let space_indicator_offset = indicators.space.width.half();
 
         for (line_index, wrapped_line) in self.wrapped_lines.iter().enumerate() {
+            let mapping = &self.visual_mappings[line_index];
             for (relative_offset, c) in wrapped_line.text.char_indices() {
+                if mapping.display_offset_is_injected(relative_offset) {
+                    continue;
+                }
                 if matches!(c, ' ' | '\t') {
                     let is_tab = c == '\t';
                     let start_x = wrapped_line.x_for_index(relative_offset);
@@ -432,27 +516,33 @@ impl LineLayout {
         let x_offset = last_layout.alignment_offset(self.longest_width);
 
         for (i, line) in self.wrapped_lines.iter().enumerate() {
+            let mapping = &self.visual_mappings[i];
             let is_last = i + 1 == self.wrapped_lines.len();
 
-            let matches = if line.len == 0 {
+            let matches = if mapping.buffer_len == 0 {
                 // Empty visual lines still own their boundary offset.
                 offset == acc_len
             } else if is_last || line_end_affinity {
                 // Inclusive: cursor can sit at end of this visual line.
-                offset >= acc_len && offset <= acc_len + line.len
+                offset >= acc_len && offset <= acc_len + mapping.buffer_len
             } else {
                 // Exclusive: boundary offset belongs to the next visual line.
-                offset >= acc_len && offset < acc_len + line.len
+                offset >= acc_len && offset < acc_len + mapping.buffer_len
             };
 
             if matches {
-                let x = line.x_for_index(offset.saturating_sub(acc_len)) + x_offset;
+                let display_offset = mapping.buffer_to_display(offset.saturating_sub(acc_len));
+                let x = line.x_for_index(display_offset) + x_offset;
                 return Some(point(x, offset_y));
             }
 
             // Always advance by actual line length. The last line gets +1 so the
             // cursor can be placed after the final character.
-            acc_len += if is_last { line.len + 1 } else { line.len };
+            acc_len += if is_last {
+                mapping.buffer_len + 1
+            } else {
+                mapping.buffer_len
+            };
             offset_y += last_layout.line_height;
         }
 
@@ -466,6 +556,7 @@ impl LineLayout {
         let x = x - x_offset;
 
         for (i, line) in self.wrapped_lines.iter().enumerate() {
+            let mapping = &self.visual_mappings[i];
             let is_last = i + 1 == self.wrapped_lines.len();
             if x <= line.width {
                 let mut ix = line.closest_index_for_x(x);
@@ -475,9 +566,9 @@ impl LineLayout {
                     ix = ix.saturating_sub(c_len);
                 }
 
-                return acc_len + ix;
+                return acc_len + mapping.display_to_buffer(ix);
             }
-            acc_len += line.text.len();
+            acc_len += mapping.buffer_len;
         }
 
         acc_len
@@ -496,6 +587,7 @@ impl LineLayout {
         let mut line_top = px(0.);
         let x_offset = last_layout.alignment_offset(self.longest_width);
         for (i, line) in self.wrapped_lines.iter().enumerate() {
+            let mapping = &self.visual_mappings[i];
             let is_last = i + 1 == self.wrapped_lines.len();
             let line_bottom = line_top + last_layout.line_height;
             if pos.y >= line_top && pos.y < line_bottom {
@@ -505,10 +597,10 @@ impl LineLayout {
                     let c_len = line.text.chars().last().map(|c| c.len_utf8()).unwrap_or(0);
                     ix = ix.saturating_sub(c_len);
                 }
-                return Some(offset + ix);
+                return Some(offset + mapping.display_to_buffer(ix));
             }
 
-            offset += line.text.len();
+            offset += mapping.buffer_len;
             line_top = line_bottom;
         }
 
@@ -523,14 +615,14 @@ impl LineLayout {
         let mut offset = 0;
         let mut line_top = px(0.);
         let x_offset = last_layout.alignment_offset(self.longest_width);
-        for line in self.wrapped_lines.iter() {
+        for (line, mapping) in self.wrapped_lines.iter().zip(self.visual_mappings.iter()) {
             let line_bottom = line_top + last_layout.line_height;
             if pos.y >= line_top && pos.y < line_bottom {
                 let ix = line.index_for_x(pos.x - x_offset)?;
-                return Some(offset + ix);
+                return Some(offset + mapping.display_to_buffer(ix));
             }
 
-            offset += line.text.len();
+            offset += mapping.buffer_len;
             line_top = line_bottom;
         }
 
@@ -795,6 +887,34 @@ mod tests {
         line_layout.set_wrapped_lines(wrapped_lines);
         assert_eq!(line_layout.len(), 150);
         assert_eq!(line_layout.wrapped_lines.len(), 2);
+    }
+
+    #[test]
+    fn injected_text_mapping_keeps_buffer_offsets_authoritative() {
+        let mapping = VisualLineMapping {
+            buffer_len: 10,
+            injections: vec![
+                InjectedTextSpan {
+                    buffer_offset: 3,
+                    display_range: 3..7,
+                },
+                InjectedTextSpan {
+                    buffer_offset: 8,
+                    display_range: 12..15,
+                },
+            ],
+        };
+
+        assert_eq!(mapping.buffer_to_display(3), 3);
+        assert_eq!(mapping.buffer_to_display(4), 8);
+        assert_eq!(mapping.buffer_to_display(8), 12);
+        assert_eq!(mapping.buffer_to_display(9), 16);
+        assert_eq!(mapping.display_to_buffer(2), 2);
+        assert_eq!(mapping.display_to_buffer(3), 3);
+        assert_eq!(mapping.display_to_buffer(6), 3);
+        assert_eq!(mapping.display_to_buffer(8), 4);
+        assert_eq!(mapping.display_to_buffer(14), 8);
+        assert_eq!(mapping.display_to_buffer(16), 9);
     }
 
     #[test]

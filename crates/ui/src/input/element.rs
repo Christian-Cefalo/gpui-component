@@ -17,7 +17,11 @@ use std::{ops::Range, rc::Rc};
 use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
-    input::{RopeExt as _, blink_cursor::CURSOR_WIDTH, display_map::LineLayout},
+    input::{
+        DisplayInlayHint, RopeExt as _,
+        blink_cursor::CURSOR_WIDTH,
+        display_map::{InjectedTextSpan, LineLayout, VisualLineMapping},
+    },
     scroll::Scrollbar,
 };
 
@@ -1242,8 +1246,11 @@ impl TextElement {
         display_text: &Rope,
         last_layout: &LastLayout,
         font_size: Pixels,
+        text_style: &TextStyle,
         runs: &[TextRun],
         bg_segments: &[(Range<usize>, Hsla)],
+        inlay_hint_foreground: Hsla,
+        inlay_hint_background: Hsla,
         whitespace_indicators: Option<WhitespaceIndicators>,
         window: &mut Window,
     ) -> Vec<LineLayout> {
@@ -1301,8 +1308,10 @@ impl TextElement {
             debug_assert_eq!(line_item.len(), line_text.len());
 
             let mut wrapped_lines = SmallVec::with_capacity(1);
+            let mut visual_mappings = SmallVec::with_capacity(1);
+            let line_hints = state.lsp.inlay_hints_for_line(&state.text, buffer_line);
 
-            for range in &line_item.wrapped_lines {
+            for (visual_line_index, range) in line_item.wrapped_lines.iter().enumerate() {
                 let line_runs = runs_for_range(runs, run_offset, &range);
                 let line_runs = if bg_segments.is_empty() {
                     line_runs
@@ -1314,16 +1323,27 @@ impl TextElement {
                     )
                 };
 
-                let sub_line: SharedString = line_text[range.clone()].to_string().into();
+                let (sub_line, line_runs, mapping) = inject_inlay_hints(
+                    &line_text,
+                    range,
+                    visual_line_index,
+                    line_item.wrapped_lines.len(),
+                    &line_runs,
+                    &line_hints,
+                    &text_style,
+                    inlay_hint_foreground,
+                    inlay_hint_background,
+                );
                 let shaped_line = window
                     .text_system()
                     .shape_line(sub_line, font_size, &line_runs, None);
 
                 wrapped_lines.push(shaped_line);
+                visual_mappings.push(mapping);
             }
 
             let line_layout = LineLayout::new()
-                .lines(wrapped_lines)
+                .lines_with_mappings(wrapped_lines, visual_mappings)
                 .with_whitespaces(whitespace_indicators.clone());
             lines.push(line_layout);
 
@@ -1768,8 +1788,11 @@ impl Element for TextElement {
             &display_text,
             &last_layout,
             text_size,
+            &text_style,
             &runs,
             &document_colors,
+            cx.theme().muted_foreground,
+            cx.theme().secondary.opacity(0.8),
             whitespace_indicators,
             window,
         );
@@ -2271,6 +2294,7 @@ impl Element for TextElement {
         );
 
         self.state.update(cx, |state, cx| {
+            let visible_rows = prepaint.last_layout.visible_range.clone();
             state.last_layout = Some(prepaint.last_layout.clone());
             state.last_bounds = Some(bounds);
             state.last_cursor = Some(state.cursor());
@@ -2279,6 +2303,7 @@ impl Element for TextElement {
             state.scroll_size = prepaint.scroll_size;
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
+            state.refresh_inlay_hints(visible_rows, window, cx);
 
             cx.notify();
         });
@@ -2330,6 +2355,106 @@ fn placeholder_line_runs<'a>(
     }
 
     result
+}
+
+fn inject_inlay_hints(
+    line_text: &str,
+    range: &Range<usize>,
+    visual_line_index: usize,
+    visual_line_count: usize,
+    line_runs: &[TextRun],
+    hints: &[DisplayInlayHint],
+    text_style: &TextStyle,
+    foreground: Hsla,
+    background: Hsla,
+) -> (SharedString, Vec<TextRun>, VisualLineMapping) {
+    let mut relevant = hints
+        .iter()
+        .filter(|hint| {
+            hint.buffer_offset >= range.start
+                && hint.buffer_offset <= range.end
+                && (visual_line_index == 0 || hint.buffer_offset > range.start)
+                && (visual_line_index + 1 == visual_line_count || hint.buffer_offset <= range.end)
+        })
+        .collect::<Vec<_>>();
+    relevant.sort_by_key(|hint| hint.buffer_offset);
+
+    if relevant.is_empty() {
+        return (
+            line_text[range.clone()].to_string().into(),
+            line_runs.to_vec(),
+            VisualLineMapping {
+                buffer_len: range.len(),
+                injections: Vec::new(),
+            },
+        );
+    }
+
+    let source = &line_text[range.clone()];
+    let mut display = String::with_capacity(
+        source.len()
+            + relevant
+                .iter()
+                .map(|hint| hint.label.len() + 6)
+                .sum::<usize>(),
+    );
+    let mut display_runs = Vec::new();
+    let mut injections = Vec::with_capacity(relevant.len());
+    let mut source_cursor = 0;
+
+    for hint in relevant {
+        let anchor = hint
+            .buffer_offset
+            .saturating_sub(range.start)
+            .min(source.len());
+        if anchor > source_cursor {
+            display.push_str(&source[source_cursor..anchor]);
+            display_runs.extend(runs_for_range(line_runs, 0, &(source_cursor..anchor)));
+        }
+
+        let mut label = String::new();
+        if hint.padding_left {
+            label.push('\u{2009}');
+        }
+        label.push_str(&hint.label);
+        if hint.padding_right {
+            label.push('\u{2009}');
+        }
+        let display_start = display.len();
+        display.push_str(&label);
+        let display_end = display.len();
+        display_runs.push(TextRun {
+            len: label.len(),
+            font: text_style.font(),
+            color: foreground,
+            background_color: Some(background),
+            underline: None,
+            strikethrough: None,
+        });
+        injections.push(InjectedTextSpan {
+            buffer_offset: anchor,
+            display_range: display_start..display_end,
+        });
+        source_cursor = anchor;
+    }
+
+    if source_cursor < source.len() {
+        display.push_str(&source[source_cursor..]);
+        display_runs.extend(runs_for_range(line_runs, 0, &(source_cursor..source.len())));
+    }
+
+    debug_assert_eq!(
+        display_runs.iter().map(|run| run.len).sum::<usize>(),
+        display.len()
+    );
+    (
+        display.into(),
+        display_runs,
+        VisualLineMapping {
+            buffer_len: source.len(),
+            injections,
+        },
+    )
 }
 
 /// Get the runs for the given range.
@@ -2436,6 +2561,43 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inlay_text_is_injected_without_changing_buffer_length() {
+        let text_style = TextStyle::default();
+        let base_run = TextRun {
+            len: 7,
+            font: text_style.font(),
+            color: gpui::white(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let hints = vec![DisplayInlayHint {
+            buffer_offset: 3,
+            label: ": i32".to_string(),
+            kind: Some(lsp_types::InlayHintKind::TYPE),
+            padding_left: true,
+            padding_right: false,
+        }];
+
+        let (display, runs, mapping) = inject_inlay_hints(
+            "abc def",
+            &(0..7),
+            0,
+            1,
+            &[base_run],
+            &hints,
+            &text_style,
+            gpui::white(),
+            gpui::black(),
+        );
+
+        assert_eq!(display.as_ref(), "abc\u{2009}: i32 def");
+        assert_eq!(mapping.buffer_len, 7);
+        assert_eq!(mapping.injections.len(), 1);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), display.len());
+    }
 
     #[test]
     fn test_editor_scrollbar_layout_uses_current_scroll_size() {
