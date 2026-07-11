@@ -228,14 +228,30 @@ impl CompletionMenu {
     fn select_item(&mut self, item: &CompletionItem, window: &mut Window, cx: &mut Context<Self>) {
         let offset = self.offset;
         let item = item.clone();
-        let mut range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
+        let trigger_range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
         let editor = self.editor.clone();
 
         cx.spawn_in(window, async move |_, cx| {
+            let resolved = editor
+                .update_in(cx, |editor, window, cx| {
+                    editor
+                        .lsp
+                        .completion_provider
+                        .clone()
+                        .map(|provider| provider.resolve_completion(item.clone(), window, cx))
+                })
+                .ok()
+                .flatten();
+            let item = match resolved {
+                Some(task) => task.await.unwrap_or(item),
+                None => item,
+            };
+            let accepted = item.clone();
             editor.update_in(cx, |editor, window, cx| {
                 editor.completion_inserting = true;
 
+                let mut range = trigger_range;
                 let mut new_text = item.label.clone();
                 if let Some(text_edit) = item.text_edit.as_ref() {
                     match text_edit {
@@ -264,7 +280,22 @@ impl CompletionMenu {
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
-            })
+            })?;
+
+            let accepted_task = editor
+                .update_in(cx, |editor, window, cx| {
+                    editor
+                        .lsp
+                        .completion_provider
+                        .clone()
+                        .map(|provider| provider.completion_accepted(accepted, window, cx))
+                })
+                .ok()
+                .flatten();
+            if let Some(task) = accepted_task {
+                task.await?;
+            }
+            Ok::<(), anyhow::Error>(())
         })
         .detach();
 

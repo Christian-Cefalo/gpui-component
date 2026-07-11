@@ -67,6 +67,7 @@ pub trait CompletionProvider {
         DEFAULT_INLINE_COMPLETION_DEBOUNCE
     }
 
+    #[deprecated(note = "use resolve_completion for the accepted CompletionItem")]
     fn resolve_completions(
         &self,
         _completion_indices: Vec<usize>,
@@ -74,6 +75,33 @@ pub trait CompletionProvider {
         _: &mut Context<InputState>,
     ) -> Task<Result<bool>> {
         Task::ready(Ok(false))
+    }
+
+    /// Resolves a completion immediately before it is accepted.
+    ///
+    /// Providers should return the original item when no resolution is
+    /// required. The default keeps existing completion behavior unchanged.
+    fn resolve_completion(
+        &self,
+        item: CompletionItem,
+        _window: &mut Window,
+        _cx: &mut Context<InputState>,
+    ) -> Task<Result<CompletionItem>> {
+        Task::ready(Ok(item))
+    }
+
+    /// Runs after the resolved completion has been inserted successfully.
+    ///
+    /// This lets clients perform protocol-owned follow-up work such as an LSP
+    /// completion command without coupling the input component to a specific
+    /// language-server runtime.
+    fn completion_accepted(
+        &self,
+        _item: CompletionItem,
+        _window: &mut Window,
+        _cx: &mut Context<InputState>,
+    ) -> Task<Result<()>> {
+        Task::ready(Ok(()))
     }
 
     /// Determines if the completion should be triggered based on the given byte offset.
