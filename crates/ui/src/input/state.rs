@@ -2904,6 +2904,7 @@ impl EntityInputHandler for InputState {
         }
         if self.emit_events {
             cx.emit(InputEvent::Change);
+            cx.emit(InputEvent::SelectionChange);
         }
         cx.notify();
     }
