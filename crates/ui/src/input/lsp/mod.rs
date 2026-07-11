@@ -12,6 +12,7 @@ mod document_colors;
 mod document_highlights;
 mod hover;
 mod inlay_hints;
+mod refresh;
 mod semantic_tokens;
 
 pub use code_actions::*;
