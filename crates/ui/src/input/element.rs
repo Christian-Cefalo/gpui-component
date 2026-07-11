@@ -775,6 +775,21 @@ impl TextElement {
         paths
     }
 
+    fn layout_document_highlights(
+        &self,
+        highlights: &[(Range<usize>, Option<lsp_types::DocumentHighlightKind>)],
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+    ) -> Vec<(Path<Pixels>, Option<lsp_types::DocumentHighlightKind>)> {
+        highlights
+            .iter()
+            .filter_map(|(range, kind)| {
+                Self::layout_match_range(range.clone(), last_layout, bounds)
+                    .map(|path| (path, *kind))
+            })
+            .collect()
+    }
+
     fn layout_selections(
         &self,
         last_layout: &LastLayout,
@@ -1439,6 +1454,7 @@ pub(super) struct PrepaintState {
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
+    document_highlight_paths: Vec<(Path<Pixels>, Option<lsp_types::DocumentHighlightKind>)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
     bounds: Bounds<Pixels>,
@@ -1739,6 +1755,9 @@ impl Element for TextElement {
         let document_colors = state
             .lsp
             .document_colors_for_range(&text, &last_layout.visible_range);
+        let document_highlights = state
+            .lsp
+            .document_highlights_for_range(&text, &last_layout.visible_range);
 
         // Create shaped lines for whitespace indicators before layout
         let whitespace_indicators =
@@ -1864,6 +1883,8 @@ impl Element for TextElement {
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
+        let document_highlight_paths =
+            self.layout_document_highlights(&document_highlights, &last_layout, &bounds);
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
@@ -1944,6 +1965,7 @@ impl Element for TextElement {
             hover_highlight_path,
             hover_definition_hitbox,
             document_color_paths,
+            document_highlight_paths,
             indent_guides_path,
             fold_icon_layout,
             ghost_first_line,
@@ -2056,6 +2078,18 @@ impl Element for TextElement {
         // Paint selections
         if window.is_window_active() {
             let secondary_selection = cx.theme().selection.saturation(0.1);
+            for (path, kind) in prepaint.document_highlight_paths.iter() {
+                let color = match kind {
+                    Some(lsp_types::DocumentHighlightKind::WRITE) => {
+                        cx.theme().selection.opacity(0.42)
+                    }
+                    Some(lsp_types::DocumentHighlightKind::READ) => {
+                        cx.theme().selection.opacity(0.28)
+                    }
+                    _ => cx.theme().selection.opacity(0.2),
+                };
+                window.paint_path(path.clone(), color);
+            }
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);
 

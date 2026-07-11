@@ -4,7 +4,11 @@ use gpui::{Context, Window};
 use ropey::Rope;
 use sum_tree::Bias;
 
-use crate::{RopeExt as _, input::InputState, text::selection::word_range_from_chars};
+use crate::{
+    RopeExt as _,
+    input::{InputEvent, InputState},
+    text::selection::word_range_from_chars,
+};
 
 impl InputState {
     /// Select the word at the given offset on double-click.
@@ -17,6 +21,7 @@ impl InputState {
 
         self.selected_range = (range.start..range.end).into();
         self.selected_word_range = Some(self.selected_range);
+        cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
 
@@ -27,6 +32,7 @@ impl InputState {
         let range = TextSelector::line_range(&self.text, offset);
         self.selected_range = (range.start..range.end).into();
         self.selected_word_range = None;
+        cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
 }

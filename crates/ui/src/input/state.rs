@@ -122,7 +122,12 @@ actions!(
 #[derive(Clone)]
 pub enum InputEvent {
     Change,
-    PressEnter { secondary: bool, shift: bool },
+    /// The caret or selection moved without necessarily changing text.
+    SelectionChange,
+    PressEnter {
+        secondary: bool,
+        shift: bool,
+    },
     Focus,
     Blur,
 }
@@ -1276,6 +1281,7 @@ impl InputState {
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = (0..self.text.len()).into();
+        cx.emit(InputEvent::SelectionChange);
         cx.notify();
     }
 
@@ -2240,6 +2246,7 @@ impl InputState {
         if self.selected_range.is_empty() {
             self.update_preferred_column();
         }
+        cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
 
@@ -2247,6 +2254,7 @@ impl InputState {
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.cursor();
         self.selected_range = (offset..offset).into();
+        cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
 

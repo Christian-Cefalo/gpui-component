@@ -9,6 +9,7 @@ mod code_actions;
 mod completions;
 mod definitions;
 mod document_colors;
+mod document_highlights;
 mod hover;
 mod semantic_tokens;
 
@@ -16,6 +17,7 @@ pub use code_actions::*;
 pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
+pub use document_highlights::*;
 pub use hover::*;
 pub use semantic_tokens::*;
 
@@ -33,16 +35,20 @@ pub struct Lsp {
     pub definition_provider: Option<Rc<dyn DefinitionProvider>>,
     /// The document color provider.
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
+    /// The document highlight provider.
+    pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
     /// The range semantic tokens provider.
     pub semantic_tokens_provider: Option<Rc<dyn DocumentRangeSemanticTokensProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
+    document_highlights: Vec<lsp_types::DocumentHighlight>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
+    _document_highlight_task: Task<()>,
     _semantic_tokens_task: Task<()>,
 }
 
@@ -54,11 +60,14 @@ impl Default for Lsp {
             hover_provider: None,
             definition_provider: None,
             document_color_provider: None,
+            document_highlight_provider: None,
             semantic_tokens_provider: None,
             document_colors: vec![],
+            document_highlights: vec![],
             semantic_tokens: vec![],
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
+            _document_highlight_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
         }
     }
@@ -79,9 +88,11 @@ impl Lsp {
     /// Reset all LSP states.
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
+        self.document_highlights.clear();
         self.semantic_tokens.clear();
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
+        self._document_highlight_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
     }
 }
