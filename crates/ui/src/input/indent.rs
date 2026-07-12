@@ -208,12 +208,21 @@ impl InputState {
     /// Only for [`InputMode::PlainText`] and [`InputMode::CodeEditor`] mode with multi_line.
     pub fn tab_size(mut self, tab: TabSize) -> Self {
         debug_assert!(self.mode.is_multi_line() || self.mode.is_code_editor());
-        match &mut self.mode {
-            InputMode::PlainText { tab: t, .. } => *t = tab,
-            InputMode::CodeEditor { tab: t, .. } => *t = tab,
-            _ => {}
-        }
+        update_tab_size(&mut self.mode, tab);
         self
+    }
+
+    /// Update the tab size after the input has been created.
+    ///
+    /// Only for [`InputMode::PlainText`] and [`InputMode::CodeEditor`] modes
+    /// with multiple lines. This keeps indentation commands and rendering on
+    /// the same live setting when an editor changes document preferences.
+    pub fn set_tab_size(&mut self, tab: TabSize, _: &mut Window, cx: &mut Context<Self>) {
+        debug_assert!(self.mode.is_multi_line() || self.mode.is_code_editor());
+        if !update_tab_size(&mut self.mode, tab) {
+            return;
+        }
+        cx.notify();
     }
 
     pub(super) fn indent_inline(
@@ -393,11 +402,22 @@ impl InputState {
     }
 }
 
+fn update_tab_size(mode: &mut InputMode, tab: TabSize) -> bool {
+    match mode {
+        InputMode::PlainText { tab: current, .. } | InputMode::CodeEditor { tab: current, .. } => {
+            *current = tab;
+            true
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ropey::RopeSlice;
 
-    use super::TabSize;
+    use super::{TabSize, update_tab_size};
+    use crate::input::mode::InputMode;
 
     #[test]
     fn test_tab_size() {
@@ -437,5 +457,19 @@ mod tests {
         assert_eq!(tab.indent_count(&RopeSlice::from("  \tabc")), 6);
         assert_eq!(tab.indent_count(&RopeSlice::from(" \t abc  ")), 6);
         assert_eq!(tab.indent_count(&RopeSlice::from("abc")), 0);
+    }
+
+    #[test]
+    fn runtime_tab_size_updates_the_live_editor_mode() {
+        let mut mode = InputMode::code_editor("rust");
+        assert!(update_tab_size(
+            &mut mode,
+            TabSize {
+                tab_size: 4,
+                hard_tabs: true,
+            }
+        ));
+        assert_eq!(mode.tab_size().tab_size, 4);
+        assert!(mode.tab_size().hard_tabs);
     }
 }
