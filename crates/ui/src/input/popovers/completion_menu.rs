@@ -170,7 +170,7 @@ fn rank_completion_items(
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
     input::{
-        self, InputState, RopeExt,
+        self, CompletionInsertMode, InputState, RopeExt,
         popovers::{editor_popover, render_markdown},
         snippet::parse_snippet,
     },
@@ -190,6 +190,7 @@ fn primary_completion_edit(
     text: &Rope,
     trigger_range: std::ops::Range<usize>,
     item: &CompletionItem,
+    insert_mode: CompletionInsertMode,
 ) -> (std::ops::Range<usize>, String) {
     let mut range = trigger_range;
     let mut new_text = item
@@ -205,8 +206,12 @@ fn primary_completion_edit(
             }
             CompletionTextEdit::InsertAndReplace(edit) => {
                 new_text = edit.new_text.clone();
-                range.start = text.position_to_offset(&edit.replace.start);
-                range.end = text.position_to_offset(&edit.replace.end);
+                let selected_range = match insert_mode {
+                    CompletionInsertMode::Insert => &edit.insert,
+                    CompletionInsertMode::Replace => &edit.replace,
+                };
+                range.start = text.position_to_offset(&selected_range.start);
+                range.end = text.position_to_offset(&selected_range.end);
             }
         }
     }
@@ -646,7 +651,12 @@ impl CompletionMenu {
                 }
                 editor.completion_inserting = true;
 
-                let (range, new_text) = primary_completion_edit(&editor.text, trigger_range, &item);
+                let (range, new_text) = primary_completion_edit(
+                    &editor.text,
+                    trigger_range,
+                    &item,
+                    editor.lsp.completion_insert_mode,
+                );
                 let parsed_snippet = (item.insert_text_format == Some(InsertTextFormat::SNIPPET))
                     .then(|| parse_snippet(&new_text));
                 let new_text = parsed_snippet
@@ -1238,7 +1248,7 @@ mod tests {
         };
 
         assert_eq!(
-            primary_completion_edit(&text, 6..9, &item),
+            primary_completion_edit(&text, 6..9, &item, CompletionInsertMode::Insert),
             (6..9, "format!".to_string())
         );
     }
@@ -1283,8 +1293,39 @@ mod tests {
         };
 
         assert_eq!(
-            primary_completion_edit(&text, 6..9, &item),
+            primary_completion_edit(&text, 6..9, &item, CompletionInsertMode::Insert),
             (0..9, "format!(value)".to_string())
+        );
+    }
+
+    #[test]
+    fn insert_replace_completion_respects_the_editor_mode() {
+        let text = Rope::from_str("formatValue");
+        let item = CompletionItem {
+            label: "format".to_string(),
+            text_edit: Some(CompletionTextEdit::InsertAndReplace(
+                lsp_types::InsertReplaceEdit {
+                    new_text: "format".to_string(),
+                    insert: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 3),
+                    ),
+                    replace: lsp_types::Range::new(
+                        lsp_types::Position::new(0, 0),
+                        lsp_types::Position::new(0, 11),
+                    ),
+                },
+            )),
+            ..CompletionItem::default()
+        };
+
+        assert_eq!(
+            primary_completion_edit(&text, 0..3, &item, CompletionInsertMode::Insert),
+            (0..3, "format".to_string())
+        );
+        assert_eq!(
+            primary_completion_edit(&text, 0..3, &item, CompletionInsertMode::Replace),
+            (0..11, "format".to_string())
         );
     }
 

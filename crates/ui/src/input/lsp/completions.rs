@@ -17,6 +17,18 @@ use crate::input::{
 /// Default debounce duration for inline completions.
 const DEFAULT_INLINE_COMPLETION_DEBOUNCE: Duration = Duration::from_millis(300);
 
+/// Controls which half of an LSP `InsertReplaceEdit` is applied when a
+/// completion is accepted.
+///
+/// `Insert` matches VS Code's default: text to the right of the cursor is
+/// preserved. `Replace` opts into replacing the server-advertised suffix.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CompletionInsertMode {
+    #[default]
+    Insert,
+    Replace,
+}
+
 /// A trait for providing code completions based on the current input state and context.
 pub trait CompletionProvider {
     /// Fetches completions based on the given byte offset.
@@ -196,6 +208,31 @@ fn completion_context_for_open_menu(
 }
 
 impl InputState {
+    /// Configure whether completion items insert before or replace text to the
+    /// right of the cursor when the language server supplies both ranges.
+    pub fn completion_insert_mode(mut self, mode: CompletionInsertMode) -> Self {
+        self.lsp.completion_insert_mode = mode;
+        self
+    }
+
+    /// Update completion insertion behavior for a live editor.
+    pub fn set_completion_insert_mode(
+        &mut self,
+        mode: CompletionInsertMode,
+        cx: &mut Context<Self>,
+    ) {
+        if self.lsp.completion_insert_mode == mode {
+            return;
+        }
+        self.lsp.completion_insert_mode = mode;
+        cx.notify();
+    }
+
+    /// Return the live editor's completion insertion behavior.
+    pub fn current_completion_insert_mode(&self) -> CompletionInsertMode {
+        self.lsp.completion_insert_mode
+    }
+
     pub(crate) fn handle_completion_trigger(
         &mut self,
         new_text: &str,

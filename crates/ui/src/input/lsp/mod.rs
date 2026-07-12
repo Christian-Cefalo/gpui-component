@@ -34,6 +34,9 @@ pub use semantic_tokens::*;
 pub struct Lsp {
     /// The completion provider.
     pub completion_provider: Option<Rc<dyn CompletionProvider>>,
+    /// Whether `InsertReplaceEdit` completions preserve or replace text to the
+    /// right of the cursor.
+    pub completion_insert_mode: CompletionInsertMode,
     /// The code action providers.
     pub code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
     /// The hover provider.
@@ -77,6 +80,7 @@ impl Default for Lsp {
     fn default() -> Self {
         Self {
             completion_provider: None,
+            completion_insert_mode: CompletionInsertMode::default(),
             code_action_providers: vec![],
             hover_provider: None,
             definition_provider: None,
