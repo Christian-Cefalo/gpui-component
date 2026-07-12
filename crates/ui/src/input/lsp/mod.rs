@@ -11,6 +11,7 @@ mod completions;
 mod definitions;
 mod document_colors;
 mod document_highlights;
+mod document_links;
 mod folding_ranges;
 mod hover;
 mod inlay_hints;
@@ -24,6 +25,7 @@ pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
 pub use document_highlights::*;
+pub use document_links::*;
 pub use folding_ranges::*;
 pub use hover::*;
 pub use inlay_hints::*;
@@ -51,6 +53,8 @@ pub struct Lsp {
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
     /// The document highlight provider.
     pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
+    /// The document link provider.
+    pub document_link_provider: Option<Rc<dyn DocumentLinkProvider>>,
     /// The document folding-range provider.
     pub folding_range_provider: Option<Rc<dyn FoldingRangeProvider>>,
     /// The viewport inlay-hint provider.
@@ -62,6 +66,10 @@ pub struct Lsp {
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<lsp_types::DocumentHighlight>,
+    document_links: Vec<lsp_types::DocumentLink>,
+    active_document_link: Option<lsp_types::DocumentLink>,
+    document_link_generation: u64,
+    document_link_requested_generation: Option<u64>,
     code_lenses: Vec<lsp_types::CodeLens>,
     code_lens_generation: u64,
     code_lens_requested_generation: Option<u64>,
@@ -78,6 +86,8 @@ pub struct Lsp {
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
+    _document_link_task: Task<()>,
+    _document_link_resolve_task: Task<Result<()>>,
     _code_lens_task: Task<()>,
     _code_lens_resolve_task: Task<()>,
     _code_lens_command_task: Task<Result<()>>,
@@ -98,12 +108,17 @@ impl Default for Lsp {
             definition_provider: None,
             document_color_provider: None,
             document_highlight_provider: None,
+            document_link_provider: None,
             folding_range_provider: None,
             inlay_hint_provider: None,
             selection_range_provider: None,
             semantic_tokens_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
+            document_links: vec![],
+            active_document_link: None,
+            document_link_generation: 0,
+            document_link_requested_generation: None,
             code_lenses: vec![],
             code_lens_generation: 0,
             code_lens_requested_generation: None,
@@ -117,6 +132,8 @@ impl Default for Lsp {
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
+            _document_link_task: Task::ready(()),
+            _document_link_resolve_task: Task::ready(Ok(())),
             _code_lens_task: Task::ready(()),
             _code_lens_resolve_task: Task::ready(()),
             _code_lens_command_task: Task::ready(Ok(())),
@@ -139,6 +156,7 @@ impl Lsp {
         self.inlay_hint_range = None;
         self.inlay_hints.clear();
         self.invalidate_code_lenses();
+        self.invalidate_document_links();
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.folding_ranges.clear();
@@ -151,6 +169,10 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
         self.document_highlights.clear();
+        self.document_links.clear();
+        self.active_document_link = None;
+        self.document_link_generation = self.document_link_generation.wrapping_add(1);
+        self.document_link_requested_generation = None;
         self.code_lenses.clear();
         self.code_lens_generation = self.code_lens_generation.wrapping_add(1);
         self.code_lens_requested_generation = None;
@@ -164,6 +186,8 @@ impl Lsp {
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
+        self._document_link_task = Task::ready(());
+        self._document_link_resolve_task = Task::ready(Ok(()));
         self._code_lens_task = Task::ready(());
         self._code_lens_resolve_task = Task::ready(());
         self._code_lens_command_task = Task::ready(Ok(()));
@@ -258,16 +282,23 @@ impl InputState {
         cx: &mut Context<InputState>,
     ) {
         let had_definition = !self.hover_definition.is_empty();
+        let had_document_link = self.lsp.active_document_link.is_some();
         let had_popover = self.hover_popover.is_some();
 
         if event.modifiers.secondary() {
-            self.handle_hover_definition(offset, window, cx);
+            if self.handle_hover_document_link(offset) {
+                self.hover_definition.clear();
+            } else {
+                self.handle_hover_definition(offset, window, cx);
+            }
         } else {
+            self.clear_active_document_link();
             self.hover_definition.clear();
             self.handle_hover_popover(offset, window, cx);
         }
 
         let changed = had_definition == self.hover_definition.is_empty()
+            || had_document_link != self.lsp.active_document_link.is_some()
             || had_popover != self.hover_popover.is_some();
         if changed {
             cx.notify();
@@ -276,6 +307,7 @@ impl InputState {
 
     pub(crate) fn clear_hover_state(&mut self, cx: &mut Context<InputState>) {
         self.hover_definition.clear();
+        self.clear_active_document_link();
         self.hover_popover = None;
         self.lsp._hover_task = Task::ready(Ok(()));
         cx.notify();

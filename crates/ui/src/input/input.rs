@@ -336,6 +336,10 @@ impl RenderOnce for Input {
                     window.listener_for(&self.state, InputState::on_action_go_to_definition),
                 );
 
+                let result = result.on_action(
+                    window.listener_for(&self.state, InputState::on_action_open_document_link),
+                );
+
                 result
             })
             .on_action(window.listener_for(&self.state, InputState::select_all))

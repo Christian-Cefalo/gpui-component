@@ -121,6 +121,7 @@ actions!(
         ToggleCodeActions,
         Search,
         GoToDefinition,
+        OpenDocumentLink,
     ]
 );
 
@@ -1756,6 +1757,7 @@ impl InputState {
 
             let is_enable = !self.disabled;
             let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
+            let has_document_link = is_enable && self.has_document_link_at_cursor();
             let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
             let is_selected = !self.selected_range.is_empty();
             let has_paste = is_enable && cx.read_from_clipboard().is_some();
@@ -1763,6 +1765,11 @@ impl InputState {
             let mut menu = NativeMenu::new();
             if is_code_editor {
                 menu = menu
+                    .menu_with_disabled(
+                        "Open Link",
+                        !has_document_link,
+                        Box::new(crate::input::OpenDocumentLink),
+                    )
                     .menu_with_disabled(
                         rust_i18n::t!("Input.Go to Definition"),
                         !has_goto_definition,
@@ -1824,6 +1831,10 @@ impl InputState {
 
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
+
+        if self.handle_click_document_link(event, offset, window, cx) {
+            return;
+        }
 
         if self.handle_click_hover_definition(event, offset, window, cx) {
             return;
@@ -3258,10 +3269,10 @@ impl Render for InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::CodeLensProvider;
+    use crate::input::{CodeLensProvider, DocumentLinkProvider};
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
-    use lsp_types::{CodeLens, Command, Position as LspPosition, Range as LspRange};
+    use lsp_types::{CodeLens, Command, DocumentLink, Position as LspPosition, Range as LspRange};
 
     struct InputView {
         input: Entity<InputState>,
@@ -3303,6 +3314,10 @@ mod tests {
 
     struct StaticCodeLensProvider;
 
+    struct StaticDocumentLinkProvider {
+        activated: Rc<Cell<bool>>,
+    }
+
     impl CodeLensProvider for StaticCodeLensProvider {
         fn code_lenses(
             &self,
@@ -3330,6 +3345,68 @@ mod tests {
         ) -> Task<anyhow::Result<()>> {
             Task::ready(Ok(()))
         }
+    }
+
+    impl DocumentLinkProvider for StaticDocumentLinkProvider {
+        fn document_links(
+            &self,
+            _text: &Rope,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<DocumentLink>>> {
+            Task::ready(Ok(vec![DocumentLink {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 5)),
+                target: Some("https://example.com/docs".parse().unwrap()),
+                tooltip: Some("Open docs".to_string()),
+                data: None,
+            }]))
+        }
+
+        fn activate_document_link(
+            &self,
+            _link: &DocumentLink,
+            _window: &mut Window,
+            _cx: &mut Context<InputState>,
+        ) -> bool {
+            self.activated.set(true);
+            true
+        }
+    }
+
+    #[gpui::test]
+    fn document_links_refresh_activate_and_invalidate_with_editor_text(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let activated = Rc::new(Cell::new(false));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha beta", window, cx);
+                state.lsp.document_link_provider = Some(Rc::new(StaticDocumentLinkProvider {
+                    activated: activated.clone(),
+                }));
+                state.refresh_document_links(window, cx);
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1_100));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert_eq!(state.document_links().len(), 1);
+                state.move_to(2, None, cx);
+                assert!(state.has_document_link_at_cursor());
+                assert!(state.handle_hover_document_link(2));
+                assert!(state.open_document_link_at_cursor(window, cx));
+                assert!(activated.get());
+
+                state.replace_text_in_range(None, "z", window, cx);
+                assert!(state.document_links().is_empty());
+                assert!(!state.has_document_link_at_cursor());
+            });
+        });
     }
 
     #[gpui::test]

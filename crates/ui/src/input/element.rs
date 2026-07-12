@@ -1567,6 +1567,12 @@ impl TextElement {
             &cx.theme().highlight_theme,
         );
 
+        let document_link_styles = state.lsp.document_link_styles_for_range(
+            text,
+            &visible_byte_range,
+            &cx.theme().highlight_theme,
+        );
+
         // hover definition style
         if let Some(hover_style) = self.layout_hover_definition(cx) {
             styles.push(hover_style);
@@ -1576,6 +1582,7 @@ impl TextElement {
         // Diagnostics keep highest priority so errors remain visible regardless
         // of language coloring.
         styles = gpui::combine_highlights(custom_styles, styles).collect();
+        styles = gpui::combine_highlights(document_link_styles, styles).collect();
         styles = gpui::combine_highlights(diagnostic_styles, styles).collect();
 
         Some(styles)
@@ -2105,7 +2112,9 @@ impl Element for TextElement {
             None
         };
 
-        let hover_definition_hitbox = self.layout_hover_definition_hitbox(state, window, cx);
+        let hover_definition_hitbox = self
+            .layout_document_link_hitbox(state, window)
+            .or_else(|| self.layout_hover_definition_hitbox(state, window, cx));
         let indent_guides_path =
             self.layout_indent_guides(state, &bounds, &last_layout, &text_style, window);
         state
@@ -2463,6 +2472,7 @@ impl Element for TextElement {
             state.deferred_scroll_offset = None;
             state.refresh_inlay_hints(visible_rows, window, cx);
             state.refresh_code_lenses(prepaint.last_layout.visible_range.clone(), window, cx);
+            state.refresh_document_links(window, cx);
 
             cx.notify();
         });
