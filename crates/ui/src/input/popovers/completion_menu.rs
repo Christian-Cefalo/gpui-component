@@ -57,6 +57,21 @@ fn primary_completion_edit(
     (range, new_text)
 }
 
+fn should_insert_commit_character(
+    text: &Rope,
+    cursor: usize,
+    completion_text: &str,
+    character: &str,
+) -> bool {
+    let mut characters = character.chars();
+    let Some(character) = characters.next() else {
+        return false;
+    };
+    characters.next().is_none()
+        && !completion_text.ends_with(character)
+        && text.char_at(cursor) != Some(character)
+}
+
 impl ContextMenuDelegate {
     fn set_items(&mut self, items: Vec<CompletionItem>) {
         self.items = items.into_iter().map(Rc::new).collect();
@@ -190,7 +205,7 @@ impl ListDelegate for ContextMenuDelegate {
         };
 
         self.menu.update(cx, |this, cx| {
-            this.select_item(&item, window, cx);
+            this.select_item(&item, None, window, cx);
         });
     }
 }
@@ -253,7 +268,13 @@ impl CompletionMenu {
         })
     }
 
-    fn select_item(&mut self, item: &CompletionItem, window: &mut Window, cx: &mut Context<Self>) {
+    fn select_item(
+        &mut self,
+        item: &CompletionItem,
+        commit_character: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let item = item.clone();
         let trigger_range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
@@ -325,6 +346,22 @@ impl CompletionMenu {
                         .text
                         .offset_to_position(cursor.min(editor.text.len()));
                     editor.set_cursor_position(cursor, window, cx);
+                    if let Some(commit_character) = commit_character.as_deref() {
+                        let cursor = editor.cursor();
+                        if should_insert_commit_character(
+                            &editor.text,
+                            cursor,
+                            &new_text,
+                            commit_character,
+                        ) {
+                            editor.replace_text_in_range_silent(
+                                Some(editor.range_to_utf16(&(cursor..cursor))),
+                                commit_character,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
                 } else {
                     editor.replace_text_in_range_silent(
                         Some(editor.range_to_utf16(&range)),
@@ -371,6 +408,8 @@ impl CompletionMenu {
         cx.propagate();
         if input::Enter::is_primary(&*action) {
             self.on_action_enter(window, cx);
+        } else if action.partial_eq(&input::IndentInline) {
+            self.on_action_tab(window, cx);
         } else if action.partial_eq(&input::Escape) {
             self.on_action_escape(window, cx);
         } else if action.partial_eq(&input::MoveUp) {
@@ -388,7 +427,37 @@ impl CompletionMenu {
         let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
             return;
         };
-        self.select_item(&item, window, cx);
+        self.select_item(&item, None, window, cx);
+    }
+
+    fn on_action_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
+            return;
+        };
+        self.select_item(&item, None, window, cx);
+    }
+
+    pub(crate) fn accept_commit_character(
+        &mut self,
+        character: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.open || character.chars().count() != 1 {
+            return false;
+        }
+        let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
+            return false;
+        };
+        if !item
+            .commit_characters
+            .as_ref()
+            .is_some_and(|characters| characters.iter().any(|value| value == character))
+        {
+            return false;
+        }
+        self.select_item(&item, Some(character.to_string()), window, cx);
+        true
     }
 
     fn on_action_escape(&mut self, _: &mut Window, cx: &mut Context<Self>) {
@@ -511,6 +580,16 @@ mod tests {
             primary_completion_edit(&text, 6..9, &item),
             (0..9, "format!(value)".to_string())
         );
+    }
+
+    #[test]
+    fn commit_character_is_inserted_once_and_overtypes_an_existing_character() {
+        let text = Rope::from_str("format value");
+        assert!(should_insert_commit_character(&text, 6, "format", "("));
+        assert!(!should_insert_commit_character(&text, 6, "format(", "("));
+        let existing = Rope::from_str("format(value)");
+        assert!(!should_insert_commit_character(&existing, 6, "format", "("));
+        assert!(!should_insert_commit_character(&text, 6, "format", "::"));
     }
 }
 

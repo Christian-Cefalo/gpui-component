@@ -2846,6 +2846,12 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        if !self.completion_inserting
+            && self.accept_completion_commit_character(new_text, window, cx)
+        {
+            return;
+        }
+
         if self.blink_cursor.read(cx).visible() {
             self.pause_blink_cursor(cx);
         }

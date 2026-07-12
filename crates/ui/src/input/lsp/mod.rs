@@ -189,6 +189,20 @@ impl InputState {
         handled
     }
 
+    pub(crate) fn accept_completion_commit_character(
+        &mut self,
+        character: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(ContextMenu::Completion(menu)) = self.context_menu_content.as_ref() else {
+            return false;
+        };
+        menu.update(cx, |menu, cx| {
+            menu.accept_commit_character(character, window, cx)
+        })
+    }
+
     /// Apply a list of [`lsp_types::TextEdit`] to mutate the text.
     pub fn apply_lsp_edits(
         &mut self,
