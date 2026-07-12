@@ -45,6 +45,7 @@ use crate::input::{
     popovers::{ContextMenu, DiagnosticPopover, HoverPopover},
     search::SearchPanel,
     snippet::SnippetSession,
+    snippet_variables::SnippetVariableContext,
 };
 use crate::native_menu::NativeMenu;
 use crate::scroll::AutoScroll;
@@ -441,6 +442,7 @@ pub struct InputState {
 
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
+    pub(super) snippet_variable_context: SnippetVariableContext,
     /// Active LSP snippet tab stops, while their byte ranges remain valid.
     pub(super) snippet_session: Option<SnippetSession>,
     /// Mirror updates are editor-owned and must not be treated as user edits
@@ -560,6 +562,7 @@ impl InputState {
             context_menu_builder: None,
             enable_context_menu: true,
             completion_inserting: false,
+            snippet_variable_context: SnippetVariableContext::default(),
             snippet_session: None,
             snippet_tracking_suspended: false,
             hover_popover: None,
@@ -616,6 +619,19 @@ impl InputState {
         self.mode = InputMode::code_editor(language);
         self.searchable = true;
         self
+    }
+
+    /// Set stable document/workspace metadata used to resolve TextMate
+    /// variables in accepted LSP completion snippets.
+    pub fn snippet_variable_context(mut self, context: SnippetVariableContext) -> Self {
+        self.snippet_variable_context = context;
+        self
+    }
+
+    /// Replace TextMate snippet metadata after a document rename or workspace
+    /// root change.
+    pub fn set_snippet_variable_context(&mut self, context: SnippetVariableContext) {
+        self.snippet_variable_context = context;
     }
 
     /// Sets whether the context menu that shows on right-click is enabled.

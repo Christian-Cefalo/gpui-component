@@ -22,6 +22,7 @@ mod selection;
 mod snippet;
 mod snippet_session;
 mod snippet_transform;
+mod snippet_variables;
 mod state;
 
 pub(crate) use clear_button::*;
@@ -38,4 +39,5 @@ pub use number_input::{NumberInput, NumberInputEvent, NumberStep, StepAction};
 pub use otp_input::*;
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
+pub use snippet_variables::SnippetVariableContext;
 pub use state::*;

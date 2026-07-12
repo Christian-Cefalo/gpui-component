@@ -172,7 +172,8 @@ use crate::{
     input::{
         self, CompletionInsertMode, InputState, RopeExt,
         popovers::{editor_popover, render_markdown},
-        snippet::{adjust_text_indentation, parse_snippet},
+        snippet::{adjust_text_indentation, parse_snippet_with_variables},
+        snippet_variables::SnippetVariables,
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
@@ -694,9 +695,23 @@ impl CompletionMenu {
                 let base_indentation = completion_line_indentation(&editor.text, expected_cursor);
                 let line_ending = completion_document_line_ending(&editor.text);
                 let tab_size = editor.mode.tab_size();
-                let mut parsed_snippet = (item.insert_text_format
-                    == Some(InsertTextFormat::SNIPPET))
-                .then(|| parse_snippet(&new_text));
+                let mut parsed_snippet =
+                    if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
+                        let selection = editor.selected_text().to_string();
+                        let clipboard = cx
+                            .read_from_clipboard()
+                            .and_then(|clipboard| clipboard.text());
+                        let variables = SnippetVariables::for_completion(
+                            &editor.snippet_variable_context,
+                            &editor.text,
+                            expected_cursor,
+                            &selection,
+                            clipboard.as_deref(),
+                        );
+                        Some(parse_snippet_with_variables(&new_text, &variables))
+                    } else {
+                        None
+                    };
                 if adjust_indentation {
                     if let Some(snippet) = parsed_snippet.as_mut() {
                         snippet.adjust_indentation(&base_indentation, tab_size, line_ending);
@@ -1321,6 +1336,55 @@ mod tests {
 
         input.read_with(&cx, |input, _| {
             assert_eq!(input.value(), "    if condition {\n        \n    }")
+        });
+    }
+
+    #[gpui::test]
+    fn accepted_snippet_resolves_document_and_dynamic_variables(cx: &mut TestAppContext) {
+        let completion = CompletionItem {
+            label: "if".into(),
+            text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 2),
+                ),
+                new_text: "${TM_FILENAME_BASE/(.*)/${1:/upcase}/}:${TM_LINE_NUMBER}:${TM_SELECTED_TEXT:none}$0".into(),
+            })),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        };
+        let provider = Rc::new(TestCompletionProvider {
+            calls: Rc::new(Cell::new(0)),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                completion.clone(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("if", window, cx);
+                input.set_cursor_position(lsp_types::Position::new(0, 2), window, cx);
+                input.set_snippet_variable_context(
+                    crate::input::SnippetVariableContext::new("/workspace/src/main.rs")
+                        .workspace_root("/workspace"),
+                );
+            });
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "if");
+                menu.show(2, vec![completion], false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |input, _| {
+            assert_eq!(input.value(), "MAIN:1:none");
         });
     }
 

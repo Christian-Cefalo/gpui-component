@@ -3,7 +3,7 @@ use std::{
     ops::Range,
 };
 
-use super::{TabSize, snippet_transform::SnippetTransform};
+use super::{TabSize, snippet_transform::SnippetTransform, snippet_variables::SnippetVariables};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnippetTabstop {
@@ -318,6 +318,13 @@ fn track_range(range: &mut Range<usize>, edit: &Range<usize>, inserted_len: usiz
 }
 
 pub(crate) fn parse_snippet(source: &str) -> ParsedSnippet {
+    parse_snippet_with_variables(source, &SnippetVariables::default())
+}
+
+pub(crate) fn parse_snippet_with_variables(
+    source: &str,
+    variables: &SnippetVariables,
+) -> ParsedSnippet {
     const MAX_DEFAULT_RESOLUTION_PASSES: usize = 16;
 
     let mut defaults = BTreeMap::new();
@@ -331,6 +338,7 @@ pub(crate) fn parse_snippet(source: &str) -> ParsedSnippet {
             transforms: BTreeMap::new(),
             defaults: defaults.clone(),
             defined_defaults: HashSet::new(),
+            variables,
         };
         candidate.parse_until(None);
         pass += 1;
@@ -377,6 +385,7 @@ struct Parser<'a> {
     transforms: BTreeMap<u32, Vec<Option<SnippetTransform>>>,
     defaults: BTreeMap<u32, String>,
     defined_defaults: HashSet<u32>,
+    variables: &'a SnippetVariables,
 }
 
 impl Parser<'_> {
@@ -433,7 +442,9 @@ impl Parser<'_> {
             return true;
         }
         if let Some(name) = self.parse_identifier() {
-            self.text.push_str(variable_value(&name).unwrap_or(&name));
+            if let Some(value) = self.variables.resolve(&name) {
+                self.text.push_str(value);
+            }
             return true;
         }
         self.offset = start;
@@ -504,15 +515,23 @@ impl Parser<'_> {
     }
 
     fn parse_transform(&mut self, index: u32, start: usize) -> bool {
+        let Some(transform) = self.parse_transform_spec() else {
+            self.offset = start;
+            return false;
+        };
+        let value = self.defaults.get(&index).cloned().unwrap_or_default();
+        let transformed = transform.apply(&value);
+        let output_start = self.text.len();
+        self.text.push_str(&transformed);
+        let output_end = self.text.len();
+        self.record_tabstop(index, output_start..output_end, Some(transform));
+        true
+    }
+
+    fn parse_transform_spec(&mut self) -> Option<SnippetTransform> {
         self.offset += 1;
-        let Some(pattern) = self.take_transform_section(false) else {
-            self.offset = start;
-            return false;
-        };
-        let Some(format) = self.take_transform_section(true) else {
-            self.offset = start;
-            return false;
-        };
+        let pattern = self.take_transform_section(false)?;
+        let format = self.take_transform_section(true)?;
         let options_start = self.offset;
         while self.offset < self.source.len() && self.peek() != Some(b'}') {
             self.offset += self.source[self.offset..]
@@ -522,23 +541,11 @@ impl Parser<'_> {
                 .len_utf8();
         }
         if self.peek() != Some(b'}') {
-            self.offset = start;
-            return false;
+            return None;
         }
         let options = &self.source[options_start..self.offset];
         self.offset += 1;
-        let Some(transform) = SnippetTransform::parse(&pattern, &format, options) else {
-            self.offset = start;
-            return false;
-        };
-
-        let value = self.defaults.get(&index).cloned().unwrap_or_default();
-        let transformed = transform.apply(&value);
-        let output_start = self.text.len();
-        self.text.push_str(&transformed);
-        let output_end = self.text.len();
-        self.record_tabstop(index, output_start..output_end, Some(transform));
-        true
+        SnippetTransform::parse(&pattern, &format, options)
     }
 
     fn take_transform_section(&mut self, format: bool) -> Option<String> {
@@ -583,17 +590,28 @@ impl Parser<'_> {
         match self.peek() {
             Some(b'}') => {
                 self.offset += 1;
-                self.text.push_str(variable_value(name).unwrap_or(name));
+                if let Some(value) = self.variables.resolve(name) {
+                    self.text.push_str(value);
+                }
                 true
             }
             Some(b':') => {
                 self.offset += 1;
-                if let Some(value) = variable_value(name) {
+                if let Some(value) = self.variables.resolve(name) {
                     self.text.push_str(value);
                     self.skip_balanced_braces();
                 } else {
                     self.parse_until(Some(b'}'));
                 }
+                true
+            }
+            Some(b'/') => {
+                let Some(transform) = self.parse_transform_spec() else {
+                    self.offset = start;
+                    return false;
+                };
+                let value = self.variables.resolve(name).unwrap_or_default();
+                self.text.push_str(&transform.apply(value));
                 true
             }
             _ => {
@@ -697,13 +715,6 @@ fn first_choice(raw: &str) -> String {
     result
 }
 
-fn variable_value(name: &str) -> Option<&'static str> {
-    match name {
-        "TM_SELECTED_TEXT" | "CLIPBOARD" => Some(""),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +782,27 @@ mod tests {
         assert_eq!(forward_chain.text, "value value value");
         assert_eq!(forward_chain.tabstops[0].ranges, vec![0..5, 6..11]);
         assert_eq!(forward_chain.tabstops[1].ranges, vec![6..11, 12..17]);
+    }
+
+    #[test]
+    fn resolves_contextual_variables_defaults_and_variable_transforms() {
+        let context = crate::input::SnippetVariableContext::new("/workspace/src/main.rs")
+            .workspace_root("/workspace");
+        let variables = SnippetVariables::for_completion(
+            &context,
+            &crate::input::Rope::from_str("value"),
+            5,
+            "picked",
+            None,
+        );
+        let parsed = parse_snippet_with_variables(
+            "$TM_FILENAME ${TM_FILENAME_BASE/(.*)/${1:/upcase}/} \
+             ${TM_SELECTED_TEXT:fallback} ${CLIPBOARD:empty} $UNKNOWN",
+            &variables,
+        );
+
+        assert_eq!(parsed.text, "main.rs MAIN picked empty ");
+        assert!(parsed.tabstops.is_empty());
     }
 
     #[test]
