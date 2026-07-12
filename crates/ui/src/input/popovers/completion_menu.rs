@@ -7,6 +7,7 @@ use gpui::{
     prelude::FluentBuilder, px, relative,
 };
 use lsp_types::{CompletionItem, CompletionTextEdit};
+use ropey::Rope;
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
@@ -27,6 +28,33 @@ struct ContextMenuDelegate {
     menu: Entity<CompletionMenu>,
     items: Vec<Rc<CompletionItem>>,
     selected_ix: usize,
+}
+
+fn primary_completion_edit(
+    text: &Rope,
+    trigger_range: std::ops::Range<usize>,
+    item: &CompletionItem,
+) -> (std::ops::Range<usize>, String) {
+    let mut range = trigger_range;
+    let mut new_text = item
+        .insert_text
+        .clone()
+        .unwrap_or_else(|| item.label.clone());
+    if let Some(text_edit) = item.text_edit.as_ref() {
+        match text_edit {
+            CompletionTextEdit::Edit(edit) => {
+                new_text = edit.new_text.clone();
+                range.start = text.position_to_offset(&edit.range.start);
+                range.end = text.position_to_offset(&edit.range.end);
+            }
+            CompletionTextEdit::InsertAndReplace(edit) => {
+                new_text = edit.new_text.clone();
+                range.start = text.position_to_offset(&edit.replace.start);
+                range.end = text.position_to_offset(&edit.replace.end);
+            }
+        }
+    }
+    (range, new_text)
 }
 
 impl ContextMenuDelegate {
@@ -226,7 +254,6 @@ impl CompletionMenu {
     }
 
     fn select_item(&mut self, item: &CompletionItem, window: &mut Window, cx: &mut Context<Self>) {
-        let offset = self.offset;
         let item = item.clone();
         let trigger_range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
 
@@ -251,25 +278,7 @@ impl CompletionMenu {
             editor.update_in(cx, |editor, window, cx| {
                 editor.completion_inserting = true;
 
-                let mut range = trigger_range;
-                let mut new_text = item.label.clone();
-                if let Some(text_edit) = item.text_edit.as_ref() {
-                    match text_edit {
-                        CompletionTextEdit::Edit(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.range.start);
-                            range.end = editor.text.position_to_offset(&edit.range.end);
-                        }
-                        CompletionTextEdit::InsertAndReplace(edit) => {
-                            new_text = edit.new_text.clone();
-                            range.start = editor.text.position_to_offset(&edit.replace.start);
-                            range.end = editor.text.position_to_offset(&edit.replace.end);
-                        }
-                    }
-                } else if let Some(insert_text) = item.insert_text.clone() {
-                    new_text = insert_text;
-                    range = offset..offset;
-                }
+                let (range, new_text) = primary_completion_edit(&editor.text, trigger_range, &item);
 
                 let mut replacements = item
                     .additional_text_edits
@@ -461,6 +470,47 @@ impl CompletionMenu {
             scroll_origin + cursor_origin - editor.input_bounds.origin
                 + Point::new(-px(4.), last_layout.line_height + px(4.)),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn insert_text_replaces_the_typed_completion_prefix() {
+        let text = Rope::from_str("value.for");
+        let item = CompletionItem {
+            label: "format".to_string(),
+            insert_text: Some("format!".to_string()),
+            ..CompletionItem::default()
+        };
+
+        assert_eq!(
+            primary_completion_edit(&text, 6..9, &item),
+            (6..9, "format!".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_text_edit_overrides_the_trigger_range() {
+        let text = Rope::from_str("value.for");
+        let item = CompletionItem {
+            label: "format".to_string(),
+            text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 9),
+                ),
+                new_text: "format!(value)".to_string(),
+            })),
+            ..CompletionItem::default()
+        };
+
+        assert_eq!(
+            primary_completion_edit(&text, 6..9, &item),
+            (0..9, "format!(value)".to_string())
+        );
     }
 }
 
