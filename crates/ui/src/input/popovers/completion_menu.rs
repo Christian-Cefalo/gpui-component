@@ -7,7 +7,9 @@ use gpui::{
     Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Task, Window, deferred,
     div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode};
+use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, InsertTextMode,
+};
 use ropey::{LineType, Rope};
 
 type SharedCompletionResolution = Shared<futures::future::LocalBoxFuture<'static, CompletionItem>>;
@@ -291,8 +293,8 @@ fn should_insert_commit_character(
 }
 
 impl ContextMenuDelegate {
-    fn set_items(&mut self, items: Vec<CompletionItem>) {
-        self.resolved = vec![false; items.len()];
+    fn set_items(&mut self, items: Vec<CompletionItem>, resolved: bool) {
+        self.resolved = vec![resolved; items.len()];
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
     }
@@ -473,12 +475,20 @@ impl ListDelegate for ContextMenuDelegate {
 }
 
 /// A context menu for code completions and code actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CompletionMenuMode {
+    #[default]
+    Completion,
+    SnippetChoice,
+}
+
 pub struct CompletionMenu {
     offset: usize,
     editor: Entity<InputState>,
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
     incomplete: bool,
+    mode: CompletionMenuMode,
 
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
@@ -529,6 +539,7 @@ impl CompletionMenu {
                 list,
                 open: false,
                 incomplete: false,
+                mode: CompletionMenuMode::default(),
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 resolution: CompletionResolutionTracker::default(),
@@ -551,6 +562,10 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mode == CompletionMenuMode::SnippetChoice {
+            self.cancel_completion_resolution();
+            return;
+        }
         if !self.open
             || self.list.read(cx).selected_index().map(|index| index.row) != requested_index
         {
@@ -639,6 +654,10 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mode == CompletionMenuMode::SnippetChoice {
+            self.select_snippet_choice(item, window, cx);
+            return;
+        }
         let item = item.clone();
         let editor = self.editor.clone();
         let selected_index = self.list.read(cx).selected_index().map(|index| index.row);
@@ -787,7 +806,7 @@ impl CompletionMenu {
                         }
                     }
                     if let Some(parsed_snippet) = parsed_snippet.as_ref() {
-                        editor.start_snippet_session(parsed_snippet, snippet_start, cx);
+                        editor.start_snippet_session(parsed_snippet, snippet_start, window, cx);
                     }
                 } else {
                     editor.replace_text_in_range_silent(
@@ -797,7 +816,7 @@ impl CompletionMenu {
                         cx,
                     );
                     if let Some(parsed_snippet) = parsed_snippet.as_ref() {
-                        editor.start_snippet_session(parsed_snippet, range.start, cx);
+                        editor.start_snippet_session(parsed_snippet, range.start, window, cx);
                     }
                 }
                 editor.completion_inserting = false;
@@ -828,6 +847,25 @@ impl CompletionMenu {
         .detach();
 
         self.hide(cx);
+    }
+
+    fn select_snippet_choice(
+        &mut self,
+        item: &CompletionItem,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let choice = item
+            .insert_text
+            .clone()
+            .unwrap_or_else(|| item.label.clone());
+        let editor = self.editor.clone();
+        self.hide(cx);
+        window.defer(cx, move |window, cx| {
+            _ = editor.update(cx, |editor, cx| {
+                editor.accept_active_snippet_choice(&choice, window, cx);
+            });
+        });
     }
 
     pub(crate) fn handle_action(
@@ -925,11 +963,16 @@ impl CompletionMenu {
         self.open && self.incomplete
     }
 
+    pub(crate) fn is_snippet_choice(&self) -> bool {
+        self.open && self.mode == CompletionMenuMode::SnippetChoice
+    }
+
     /// Hide the completion menu and reset the trigger start offset.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
         self.cancel_completion_resolution();
         self.open = false;
         self.incomplete = false;
+        self.mode = CompletionMenuMode::Completion;
         self.trigger_start_offset = None;
         cx.notify();
     }
@@ -948,6 +991,7 @@ impl CompletionMenu {
 
     pub(crate) fn begin_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
         self.cancel_completion_resolution();
+        self.mode = CompletionMenuMode::Completion;
         self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
@@ -961,7 +1005,51 @@ impl CompletionMenu {
         cx: &mut Context<Self>,
     ) {
         self.cancel_completion_resolution();
+        self.mode = CompletionMenuMode::Completion;
         let (items, selected_index) = rank_completion_items(items.into(), &self.query);
+        self.show_ranked(offset, items, selected_index, false, incomplete, window, cx);
+    }
+
+    pub(crate) fn show_snippet_choices(
+        &mut self,
+        range: Range<usize>,
+        current_value: &str,
+        choices: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_completion_resolution();
+        self.mode = CompletionMenuMode::SnippetChoice;
+        self.trigger_start_offset = Some(range.start);
+        self.query = current_value.to_string().into();
+        let current_is_choice = choices.iter().any(|choice| choice == current_value);
+        let items = choices
+            .iter()
+            .enumerate()
+            .map(|(index, choice)| CompletionItem {
+                label: choice.clone(),
+                kind: Some(CompletionItemKind::VALUE),
+                insert_text: Some(choice.clone()),
+                filter_text: current_is_choice.then(|| format!("{current_value}_{choice}")),
+                sort_text: Some(format!("{index:08}")),
+                preselect: Some(choice == current_value),
+                ..CompletionItem::default()
+            })
+            .collect::<Vec<_>>();
+        let (items, selected_index) = rank_completion_items(items, &self.query);
+        self.show_ranked(range.end, items, selected_index, true, false, window, cx);
+    }
+
+    fn show_ranked(
+        &mut self,
+        offset: usize,
+        items: Vec<CompletionItem>,
+        selected_index: usize,
+        resolved: bool,
+        incomplete: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if items.is_empty() {
             self.hide(cx);
             return;
@@ -978,7 +1066,7 @@ impl CompletionMenu {
                 .unwrap_or(0);
 
             this.delegate_mut().query = self.query.clone();
-            this.delegate_mut().set_items(items);
+            this.delegate_mut().set_items(items, resolved);
             this.set_selected_index(Some(IndexPath::new(selected_index)), window, cx);
             this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });

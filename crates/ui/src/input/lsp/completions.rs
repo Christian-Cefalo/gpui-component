@@ -243,6 +243,10 @@ impl InputState {
             return;
         }
 
+        if self.refresh_active_snippet_choice_menu(window, cx) {
+            return;
+        }
+
         let Some(provider) = self.lsp.completion_provider.clone() else {
             return;
         };
@@ -307,6 +311,9 @@ impl InputState {
         if self.disabled || self.completion_inserting {
             return;
         }
+        if self.refresh_active_snippet_choice_menu(window, cx) {
+            return;
+        }
         let Some(provider) = self.lsp.completion_provider.clone() else {
             return;
         };
@@ -331,7 +338,7 @@ impl InputState {
         );
     }
 
-    fn completion_menu(
+    pub(in crate::input) fn completion_menu(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,

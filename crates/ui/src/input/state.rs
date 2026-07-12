@@ -3253,7 +3253,7 @@ mod tests {
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 state.set_value(snippet.text.clone(), window, cx);
-                state.start_snippet_session(&snippet, 0, cx);
+                state.start_snippet_session(&snippet, 0, window, cx);
                 assert_eq!(state.selected_range, Selection::new(0, 4));
 
                 let selected_utf16 = state.range_to_utf16(&(0..4));
@@ -3286,7 +3286,7 @@ mod tests {
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 state.set_value(snippet.text.clone(), window, cx);
-                state.start_snippet_session(&snippet, 0, cx);
+                state.start_snippet_session(&snippet, 0, window, cx);
                 assert_eq!(state.selected_range, Selection::new(0, 4));
 
                 let selected_utf16 = state.range_to_utf16(&(0..4));
@@ -3297,6 +3297,118 @@ mod tests {
                 assert_eq!(state.selected_range, Selection::new(12, 12));
                 assert!(state.snippet_session.is_none());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn snippet_choice_menu_replaces_the_active_value_and_advances(cx: &mut TestAppContext) {
+        use crate::input::{Enter, MoveDown, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1|one,two|} ${2|red,blue|}$0");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(snippet.text.clone(), window, cx);
+                state.start_snippet_session(&snippet, 0, window, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 3));
+                let Some(ContextMenu::Completion(menu)) = state.context_menu_content.as_ref()
+                else {
+                    panic!("snippet choice menu was not created")
+                };
+                assert!(menu.read(cx).is_snippet_choice());
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.down(&MoveDown, window, cx));
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, cx| {
+            assert_eq!(state.value(), "two red");
+            assert_eq!(state.selected_range, Selection::new(4, 7));
+            assert!(state.snippet_session.is_some());
+            let Some(ContextMenu::Completion(menu)) = state.context_menu_content.as_ref() else {
+                panic!("second snippet choice menu was not created")
+            };
+            assert!(menu.read(cx).is_snippet_choice());
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, cx| {
+            assert_eq!(state.value(), "two red");
+            assert_eq!(state.selected_range, Selection::new(7, 7));
+            assert!(state.snippet_session.is_none());
+            assert!(!state.is_context_menu_open(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn typing_filters_snippet_choices_without_requesting_lsp_completions(cx: &mut TestAppContext) {
+        use crate::input::{Enter, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1|red,blue|}$0");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(snippet.text.clone(), window, cx);
+                state.start_snippet_session(&snippet, 0, window, cx);
+                state.replace_text_in_range(None, "bl", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, cx| {
+            assert_eq!(state.value(), "blue");
+            assert_eq!(state.selected_range, Selection::new(4, 4));
+            assert!(state.snippet_session.is_none());
+            assert!(!state.is_context_menu_open(cx));
         });
     }
 

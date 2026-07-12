@@ -10,6 +10,7 @@ pub(crate) struct SnippetTabstop {
     pub(crate) index: u32,
     pub(crate) ranges: Vec<Range<usize>>,
     transforms: Vec<Option<SnippetTransform>>,
+    choices: Vec<Option<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -203,6 +204,7 @@ impl SnippetSession {
                     .map(|range| insertion_start + range.start..insertion_start + range.end)
                     .collect(),
                 transforms: tabstop.transforms.clone(),
+                choices: tabstop.choices.clone(),
             })
             .collect::<Vec<_>>();
         (!tabstops.is_empty()).then_some(Self {
@@ -223,6 +225,13 @@ impl SnippetSession {
             .get(self.active)
             .and_then(|tabstop| tabstop.ranges.get(1..))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn active_choices(&self) -> Option<&[String]> {
+        self.tabstops
+            .get(self.active)
+            .and_then(|tabstop| tabstop.choices.first())
+            .and_then(Option::as_deref)
     }
 
     pub(crate) fn active_mirror_replacements(&self, value: &str) -> Vec<(Range<usize>, String)> {
@@ -336,6 +345,7 @@ pub(crate) fn parse_snippet_with_variables(
             text: String::with_capacity(source.len()),
             ranges: BTreeMap::new(),
             transforms: BTreeMap::new(),
+            choices: BTreeMap::new(),
             defaults: defaults.clone(),
             defined_defaults: HashSet::new(),
             variables,
@@ -351,6 +361,7 @@ pub(crate) fn parse_snippet_with_variables(
         text,
         ranges,
         mut transforms,
+        mut choices,
         ..
     } = parser;
     let mut tabstops = ranges
@@ -359,16 +370,32 @@ pub(crate) fn parse_snippet_with_variables(
             let transforms = transforms
                 .remove(&index)
                 .unwrap_or_else(|| vec![None; ranges.len()]);
-            let mut occurrences = ranges.into_iter().zip(transforms).collect::<Vec<_>>();
+            let choices = choices
+                .remove(&index)
+                .unwrap_or_else(|| vec![None; ranges.len()]);
+            let mut occurrences = ranges
+                .into_iter()
+                .zip(transforms)
+                .zip(choices)
+                .map(|((range, transform), choices)| (range, transform, choices))
+                .collect::<Vec<_>>();
             // This editor owns one selection and updates mirrors itself. Keep
             // a normal placeholder as the editable primary even when a
             // transformed occurrence appeared first in the snippet source.
-            occurrences.sort_by_key(|(_, transform)| transform.is_some());
-            let (ranges, transforms) = occurrences.into_iter().unzip();
+            occurrences.sort_by_key(|(_, transform, _)| transform.is_some());
+            let mut ranges = Vec::with_capacity(occurrences.len());
+            let mut transforms = Vec::with_capacity(occurrences.len());
+            let mut choices = Vec::with_capacity(occurrences.len());
+            for (range, transform, occurrence_choices) in occurrences {
+                ranges.push(range);
+                transforms.push(transform);
+                choices.push(occurrence_choices);
+            }
             SnippetTabstop {
                 index,
                 ranges,
                 transforms,
+                choices,
             }
         })
         .collect::<Vec<_>>();
@@ -383,6 +410,7 @@ struct Parser<'a> {
     text: String,
     ranges: BTreeMap<u32, Vec<Range<usize>>>,
     transforms: BTreeMap<u32, Vec<Option<SnippetTransform>>>,
+    choices: BTreeMap<u32, Vec<Option<Vec<String>>>>,
     defaults: BTreeMap<u32, String>,
     defined_defaults: HashSet<u32>,
     variables: &'a SnippetVariables,
@@ -467,7 +495,7 @@ impl Parser<'_> {
                     self.defaults
                         .insert(index, self.text[output_start..output_end].to_string());
                 }
-                self.record_tabstop(index, output_start..output_end, None);
+                self.record_tabstop(index, output_start..output_end, None, None);
                 true
             }
             Some(b'|') => self.parse_choice(index, start),
@@ -480,6 +508,10 @@ impl Parser<'_> {
     }
 
     fn parse_choice(&mut self, index: u32, start: usize) -> bool {
+        if index == 0 {
+            self.offset = start;
+            return false;
+        }
         self.offset += 1;
         let choice_start = self.offset;
         let mut escaped = false;
@@ -495,9 +527,17 @@ impl Parser<'_> {
                 self.offset += 1;
                 continue;
             }
-            if byte == b'|' && self.source.as_bytes()[self.offset + 1] == b'}' {
+            if byte == b'|' {
+                if self.source.as_bytes()[self.offset + 1] != b'}' {
+                    self.offset = start;
+                    return false;
+                }
                 let raw = &self.source[choice_start..self.offset];
-                let first = first_choice(raw);
+                let Some(choices) = parse_choice_options(raw) else {
+                    self.offset = start;
+                    return false;
+                };
+                let first = choices[0].clone();
                 self.offset += 2;
                 let output_start = self.text.len();
                 self.text.push_str(&first);
@@ -505,7 +545,7 @@ impl Parser<'_> {
                 if self.defined_defaults.insert(index) {
                     self.defaults.insert(index, first);
                 }
-                self.record_tabstop(index, output_start..output_end, None);
+                self.record_tabstop(index, output_start..output_end, None, Some(choices));
                 return true;
             }
             self.offset += 1;
@@ -524,7 +564,7 @@ impl Parser<'_> {
         let output_start = self.text.len();
         self.text.push_str(&transformed);
         let output_end = self.text.len();
-        self.record_tabstop(index, output_start..output_end, Some(transform));
+        self.record_tabstop(index, output_start..output_end, Some(transform), None);
         true
     }
 
@@ -649,7 +689,7 @@ impl Parser<'_> {
             self.text.push_str(value);
         }
         let output_end = self.text.len();
-        self.record_tabstop(index, output_start..output_end, None);
+        self.record_tabstop(index, output_start..output_end, None, None);
     }
 
     fn record_tabstop(
@@ -657,9 +697,11 @@ impl Parser<'_> {
         index: u32,
         range: Range<usize>,
         transform: Option<SnippetTransform>,
+        choices: Option<Vec<String>>,
     ) {
         self.ranges.entry(index).or_default().push(range);
         self.transforms.entry(index).or_default().push(transform);
+        self.choices.entry(index).or_default().push(choices);
     }
 
     fn parse_number(&mut self) -> Option<u32> {
@@ -694,25 +736,38 @@ impl Parser<'_> {
     }
 }
 
-fn first_choice(raw: &str) -> String {
-    let mut result = String::new();
+fn parse_choice_options(raw: &str) -> Option<Vec<String>> {
+    let mut options = Vec::new();
+    let mut current = String::new();
     let mut escaped = false;
     for character in raw.chars() {
         if escaped {
-            result.push(character);
+            if matches!(character, ',' | '|' | '\\') {
+                current.push(character);
+            } else {
+                current.push('\\');
+                current.push(character);
+            }
             escaped = false;
         } else if character == '\\' {
             escaped = true;
         } else if character == ',' {
-            break;
+            if current.is_empty() {
+                return None;
+            }
+            options.push(std::mem::take(&mut current));
         } else {
-            result.push(character);
+            current.push(character);
         }
     }
     if escaped {
-        result.push('\\');
+        current.push('\\');
     }
-    result
+    if current.is_empty() {
+        return None;
+    }
+    options.push(current);
+    Some(options)
 }
 
 #[cfg(test)]
@@ -730,16 +785,19 @@ mod tests {
                     index: 1,
                     ranges: vec![3..7, 17..21],
                     transforms: vec![None, None],
+                    choices: vec![None, None],
                 },
                 SnippetTabstop {
                     index: 2,
                     ranges: vec![8..13, 22..27],
                     transforms: vec![None, None],
+                    choices: vec![Some(vec!["value".into(), "other".into()]), None],
                 },
                 SnippetTabstop {
                     index: 0,
                     ranges: vec![31..31],
                     transforms: vec![None],
+                    choices: vec![None],
                 },
             ]
         );
@@ -752,6 +810,32 @@ mod tests {
         assert_eq!(parsed.tabstops[0].ranges, vec![0..11]);
         assert_eq!(parsed.tabstops[1].ranges, vec![6..11]);
         assert_eq!(parsed.tabstops[2].ranges, vec![18..21]);
+        assert_eq!(
+            parsed.tabstops[2].choices[0],
+            Some(vec!["a,b".into(), "c".into()])
+        );
+    }
+
+    #[test]
+    fn choices_preserve_textmate_escapes_and_reject_invalid_or_final_choices() {
+        let parsed = parse_snippet(r"${1|one\,two,three\|four,path\\name,keep\q|}$0");
+        assert_eq!(parsed.text, "one,two");
+        assert_eq!(
+            parsed.tabstops[0].choices[0],
+            Some(vec![
+                "one,two".into(),
+                "three|four".into(),
+                "path\\name".into(),
+                "keep\\q".into(),
+            ])
+        );
+
+        let invalid = parse_snippet("${1|one,two,|} ${2|one|two|} ${0|final,choice|}");
+        assert_eq!(
+            invalid.text,
+            "${1|one,two,|} ${2|one|two|} ${0|final,choice|}"
+        );
+        assert!(invalid.tabstops.is_empty());
     }
 
     #[test]
