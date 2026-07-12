@@ -47,6 +47,7 @@ impl InputState {
         let offset = offset.clamp(0, self.text.len());
         self.cursor_line_end_affinity = false;
         self.selected_range = (offset..offset).into();
+        self.cancel_snippet_session_if_selection_outside(cx);
         self.scroll_to(offset, direction, cx);
         self.pause_blink_cursor(cx);
         self.update_preferred_column();

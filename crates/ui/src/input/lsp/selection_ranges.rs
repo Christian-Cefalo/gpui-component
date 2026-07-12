@@ -95,6 +95,7 @@ impl InputState {
                 input.selection_reversed = false;
                 input.selected_word_range = None;
                 input.lsp.selection_range_last = Some(input.selected_range);
+                input.cancel_snippet_session_if_selection_outside(cx);
                 cx.emit(InputEvent::SelectionChange);
                 cx.notify();
             });
@@ -118,6 +119,7 @@ impl InputState {
         self.selected_range = previous;
         self.selection_reversed = false;
         self.selected_word_range = None;
+        self.cancel_snippet_session_if_selection_outside(cx);
         self.lsp.selection_range_last = if self.lsp.selection_range_history.is_empty() {
             None
         } else {

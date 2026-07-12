@@ -6,6 +6,18 @@ use super::{InputEvent, InputState, Selection, popovers::ContextMenu, snippet::P
 use crate::input::snippet::SnippetSession;
 
 impl InputState {
+    pub(super) fn cancel_snippet_session_if_selection_outside(&mut self, cx: &mut Context<Self>) {
+        let selection = self.selected_range.start..self.selected_range.end;
+        let should_cancel = self
+            .snippet_session
+            .as_ref()
+            .is_some_and(|session| !session.contains_selection(selection));
+        if should_cancel {
+            self.snippet_session = None;
+            self.hide_snippet_choice_menu(cx);
+        }
+    }
+
     pub(super) fn start_snippet_session(
         &mut self,
         parsed: &ParsedSnippet,

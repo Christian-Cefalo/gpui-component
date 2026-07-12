@@ -260,6 +260,14 @@ impl SnippetSession {
             .is_some_and(|tabstop| tabstop.index == 0)
     }
 
+    pub(crate) fn contains_selection(&self, selection: Range<usize>) -> bool {
+        self.tabstops
+            .iter()
+            .filter(|tabstop| tabstop.index != 0)
+            .flat_map(|tabstop| &tabstop.ranges)
+            .any(|range| range.start <= selection.start && selection.end <= range.end)
+    }
+
     pub(crate) fn move_next(&mut self) -> Option<Range<usize>> {
         if self.active + 1 >= self.tabstops.len() {
             return None;

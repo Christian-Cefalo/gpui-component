@@ -1317,6 +1317,7 @@ impl InputState {
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = (0..self.text.len()).into();
+        self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
         cx.notify();
     }
@@ -2282,6 +2283,7 @@ impl InputState {
         if self.selected_range.is_empty() {
             self.update_preferred_column();
         }
+        self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
@@ -2290,6 +2292,7 @@ impl InputState {
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.cursor();
         self.selected_range = (offset..offset).into();
+        self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
@@ -3409,6 +3412,34 @@ mod tests {
             assert_eq!(state.selected_range, Selection::new(4, 4));
             assert!(state.snippet_session.is_none());
             assert!(!state.is_context_menu_open(cx));
+        });
+    }
+
+    #[gpui::test]
+    fn snippet_session_cancels_outside_placeholders_but_keeps_future_placeholder_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::input::{IndentInline, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1:name} + ${2:value}$0");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(snippet.text.clone(), window, cx);
+                state.start_snippet_session(&snippet, 0, window, cx);
+                state.move_to(5, None, cx);
+                assert!(state.snippet_session.is_none());
+
+                state.start_snippet_session(&snippet, 0, window, cx);
+                state.move_to(9, None, cx);
+                assert!(state.snippet_session.is_some());
+                state.indent_inline(&IndentInline, window, cx);
+                assert_eq!(state.selected_range, Selection::new(7, 12));
+                assert!(state.snippet_session.is_some());
+            });
         });
     }
 
