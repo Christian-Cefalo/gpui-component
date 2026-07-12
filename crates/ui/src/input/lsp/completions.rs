@@ -171,6 +171,30 @@ fn completion_word_start(text: &Rope, cursor: usize) -> usize {
     start
 }
 
+fn completion_context_for_open_menu(
+    context: Option<CompletionContext>,
+    menu_open: bool,
+    menu_incomplete: bool,
+    new_text: &str,
+) -> Option<CompletionContext> {
+    if let Some(mut context) = context {
+        if menu_incomplete && context.trigger_kind == lsp_types::CompletionTriggerKind::INVOKED {
+            context.trigger_kind =
+                lsp_types::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS;
+            context.trigger_character = None;
+        }
+        return Some(context);
+    }
+    (menu_open && new_text.is_empty()).then_some(CompletionContext {
+        trigger_kind: if menu_incomplete {
+            lsp_types::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
+        } else {
+            lsp_types::CompletionTriggerKind::INVOKED
+        },
+        trigger_character: None,
+    })
+}
+
 impl InputState {
     pub(crate) fn handle_completion_trigger(
         &mut self,
@@ -195,14 +219,15 @@ impl InputState {
             Some(ContextMenu::Completion(menu)) if menu.read(cx).is_open() => Some(menu.clone()),
             _ => None,
         };
-        let completion_context = provider
-            .completion_context(&self.text, new_offset, new_text, cx)
-            .or_else(|| {
-                (existing_menu.is_some() && new_text.is_empty()).then_some(CompletionContext {
-                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
-                    trigger_character: None,
-                })
-            });
+        let menu_incomplete = existing_menu
+            .as_ref()
+            .is_some_and(|menu| menu.read(cx).is_incomplete());
+        let completion_context = completion_context_for_open_menu(
+            provider.completion_context(&self.text, new_offset, new_text, cx),
+            existing_menu.is_some(),
+            menu_incomplete,
+            new_text,
+        );
         let Some(completion_context) = completion_context else {
             if let Some(menu) = existing_menu {
                 _ = menu.update(cx, |menu, cx| menu.hide(cx));
@@ -302,10 +327,14 @@ impl InputState {
             provider.completions(&self.text, offset, completion_context, window, cx);
         self._context_menu_task = cx.spawn_in(window, async move |editor, cx| {
             let mut completions: Vec<CompletionItem> = vec![];
+            let mut is_incomplete = false;
             if let Some(provider_responses) = provider_responses.await.ok() {
                 match provider_responses {
                     CompletionResponse::Array(items) => completions.extend(items),
-                    CompletionResponse::List(list) => completions.extend(list.items),
+                    CompletionResponse::List(list) => {
+                        is_incomplete = list.is_incomplete;
+                        completions.extend(list.items);
+                    }
                 }
             }
 
@@ -325,7 +354,7 @@ impl InputState {
                     }
 
                     _ = menu.update(cx, |menu, cx| {
-                        menu.show(offset, completions, window, cx);
+                        menu.show(offset, completions, is_incomplete, window, cx);
                     });
 
                     cx.notify();
@@ -452,6 +481,35 @@ mod tests {
         assert_eq!(
             completion_word_start(&punctuation, punctuation.len()),
             punctuation.len()
+        );
+    }
+
+    #[test]
+    fn incomplete_completion_lists_retrigger_without_losing_trigger_characters() {
+        let invoked = CompletionContext {
+            trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+            trigger_character: None,
+        };
+        assert_eq!(
+            completion_context_for_open_menu(Some(invoked), true, true, "m")
+                .unwrap()
+                .trigger_kind,
+            lsp_types::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
+        );
+
+        let trigger = CompletionContext {
+            trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
+            trigger_character: Some(".".into()),
+        };
+        assert_eq!(
+            completion_context_for_open_menu(Some(trigger.clone()), true, true, "."),
+            Some(trigger)
+        );
+        assert_eq!(
+            completion_context_for_open_menu(None, true, true, "")
+                .unwrap()
+                .trigger_kind,
+            lsp_types::CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
         );
     }
 }

@@ -222,6 +222,21 @@ fn completion_trigger_range(
     (current_cursor >= start).then_some(start..current_cursor)
 }
 
+fn completion_item_display_width(item: &CompletionItem) -> usize {
+    item.label.len()
+        + item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.as_ref())
+            .map_or(0, String::len)
+        + item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.description.as_ref())
+            .map_or(0, String::len)
+        + item.detail.as_ref().map_or(0, String::len)
+}
+
 fn should_insert_commit_character(
     text: &Rope,
     cursor: usize,
@@ -302,6 +317,14 @@ impl RenderOnce for CompletionMenuItem {
         let item = self.item;
 
         let deprecated = item.deprecated.unwrap_or(false);
+        let label_detail = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.detail.clone());
+        let label_description = item
+            .label_details
+            .as_ref()
+            .and_then(|details| details.description.clone());
         let highlight_query = completion_query_fragment(&self.highlight_prefix);
         let highlights = completion_match(highlight_query, &item.label)
             .map(|(_, ranges)| {
@@ -333,7 +356,24 @@ impl RenderOnce for CompletionMenuItem {
                 this.bg(cx.theme().tokens.accent)
                     .text_color(cx.theme().accent_foreground)
             })
-            .child(div().child(StyledText::new(item.label.clone()).with_highlights(highlights)))
+            .child(
+                h_flex()
+                    .gap_0()
+                    .child(
+                        div()
+                            .child(StyledText::new(item.label.clone()).with_highlights(highlights)),
+                    )
+                    .when_some(label_detail, |this, detail| {
+                        this.child(Label::new(detail).text_color(cx.theme().muted_foreground))
+                    }),
+            )
+            .when_some(label_description, |this, description| {
+                this.child(
+                    Label::new(description)
+                        .text_color(cx.theme().muted_foreground)
+                        .italic(),
+                )
+            })
             .when(item.detail.is_some(), |this| {
                 this.child(
                     Label::new(item.detail.as_deref().unwrap_or("").to_string())
@@ -400,6 +440,7 @@ pub struct CompletionMenu {
     editor: Entity<InputState>,
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
+    incomplete: bool,
 
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
@@ -449,6 +490,7 @@ impl CompletionMenu {
                 editor,
                 list,
                 open: false,
+                incomplete: false,
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 resolution: CompletionResolutionTracker::default(),
@@ -807,10 +849,15 @@ impl CompletionMenu {
         self.open
     }
 
+    pub(crate) fn is_incomplete(&self) -> bool {
+        self.open && self.incomplete
+    }
+
     /// Hide the completion menu and reset the trigger start offset.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
         self.cancel_completion_resolution();
         self.open = false;
+        self.incomplete = false;
         self.trigger_start_offset = None;
         cx.notify();
     }
@@ -837,6 +884,7 @@ impl CompletionMenu {
         &mut self,
         offset: usize,
         items: impl Into<Vec<CompletionItem>>,
+        incomplete: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -848,13 +896,12 @@ impl CompletionMenu {
         }
         self.offset = offset;
         self.open = true;
+        self.incomplete = incomplete;
         self.list.update(cx, |this, cx| {
             let longest_ix = items
                 .iter()
                 .enumerate()
-                .max_by_key(|(_, item)| {
-                    item.label.len() + item.detail.as_ref().map(|d| d.len()).unwrap_or(0)
-                })
+                .max_by_key(|(_, item)| completion_item_display_width(item))
                 .map(|(ix, _)| ix)
                 .unwrap_or(0);
 
@@ -1034,6 +1081,7 @@ mod tests {
                         label: "format".into(),
                         ..CompletionItem::default()
                     }],
+                    false,
                     window,
                     cx,
                 );
@@ -1086,6 +1134,7 @@ mod tests {
                         label: "format".into(),
                         ..CompletionItem::default()
                     }],
+                    false,
                     window,
                     cx,
                 );
@@ -1134,6 +1183,7 @@ mod tests {
                             ..CompletionItem::default()
                         },
                     ],
+                    false,
                     window,
                     cx,
                 );
@@ -1198,6 +1248,23 @@ mod tests {
         assert_eq!(completion_trigger_range(Some(6), 9, 12), Some(6..12));
         assert_eq!(completion_trigger_range(Some(6), 9, 5), None);
         assert_eq!(completion_trigger_range(None, 9, 12), Some(9..12));
+    }
+
+    #[test]
+    fn completion_measurement_includes_label_details_and_description() {
+        let item = CompletionItem {
+            label: "map".into(),
+            label_details: Some(lsp_types::CompletionItemLabelDetails {
+                detail: Some("(callback)".into()),
+                description: Some("Iterator".into()),
+            }),
+            detail: Some("fn map<B>".into()),
+            ..CompletionItem::default()
+        };
+        assert_eq!(
+            completion_item_display_width(&item),
+            "map(callback)Iteratorfn map<B>".len()
+        );
     }
 
     #[test]
