@@ -649,6 +649,7 @@ impl CompletionMenu {
                 if editor.cursor() != expected_cursor || editor.text != expected_text {
                     return false;
                 }
+                editor.start_undo_transaction();
                 editor.completion_inserting = true;
 
                 let (range, new_text) = primary_completion_edit(
@@ -740,6 +741,7 @@ impl CompletionMenu {
                     }
                 }
                 editor.completion_inserting = false;
+                editor.end_undo_transaction();
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
                 true
@@ -1161,6 +1163,67 @@ mod tests {
 
         assert_eq!(calls.get(), 1);
         input.read_with(&cx, |input, _| assert_eq!(input.value(), "format"));
+    }
+
+    #[gpui::test]
+    fn accepted_completion_is_one_undo_step_separate_from_typed_prefix(cx: &mut TestAppContext) {
+        let completion = CompletionItem {
+            label: "format".into(),
+            text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 2),
+                ),
+                new_text: "format".into(),
+            })),
+            additional_text_edits: Some(vec![lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 0),
+                ),
+                new_text: "use fmt;\n".into(),
+            }]),
+            ..CompletionItem::default()
+        };
+        let provider = Rc::new(TestCompletionProvider {
+            calls: Rc::new(Cell::new(0)),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                completion.clone(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("f", window, cx);
+                input.set_cursor_position(lsp_types::Position::new(0, 1), window, cx);
+                input.insert("o", window, cx);
+            });
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "fo");
+                menu.show(2, vec![completion], false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        cx.run_until_parked();
+        input.read_with(&cx, |input, _| {
+            assert_eq!(input.value(), "use fmt;\nformat")
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.undo(&crate::input::Undo, window, cx));
+        });
+        input.read_with(&cx, |input, _| assert_eq!(input.value(), "fo"));
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.undo(&crate::input::Undo, window, cx));
+        });
+        input.read_with(&cx, |input, _| assert_eq!(input.value(), "f"));
     }
 
     #[gpui::test]

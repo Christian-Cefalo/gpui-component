@@ -1,5 +1,5 @@
-use std::fmt::Debug;
 use instant::{Duration, Instant};
+use std::fmt::Debug;
 
 /// A HistoryItem represents a single change in the history.
 /// It must implement Clone and PartialEq to be used in the History.
@@ -28,6 +28,7 @@ pub struct History<I: HistoryItem> {
     max_undos: usize,
     group_interval: Option<Duration>,
     grouping: bool,
+    transaction_depth: usize,
     unique: bool,
 }
 
@@ -45,6 +46,7 @@ where
             max_undos: 1000,
             group_interval: None,
             grouping: false,
+            transaction_depth: 0,
             unique: false,
         }
     }
@@ -78,10 +80,36 @@ where
         self.grouping = false;
     }
 
+    /// Start an explicit undo transaction separated from edits before it.
+    ///
+    /// Nested transactions share one version. Call [`Self::end_transaction`]
+    /// after the final edit to create the boundary for subsequent changes.
+    pub fn start_transaction(&mut self) {
+        if self.transaction_depth == 0 {
+            self.version = self.version.saturating_add(1);
+        }
+        self.transaction_depth = self.transaction_depth.saturating_add(1);
+    }
+
+    /// Finish an explicit undo transaction and separate later edits from it.
+    pub fn end_transaction(&mut self) {
+        if self.transaction_depth == 0 {
+            return;
+        }
+        self.transaction_depth -= 1;
+        if self.transaction_depth == 0 {
+            self.version = self.version.saturating_add(1);
+            self.last_changed_at = Instant::now();
+        }
+    }
+
     /// Increment the version number if the last change was made more than `GROUP_INTERVAL` milliseconds ago.
     fn inc_version(&mut self) -> usize {
         let t = Instant::now();
-        if !self.grouping && Some(self.last_changed_at.elapsed()) > self.group_interval {
+        if self.transaction_depth == 0
+            && !self.grouping
+            && Some(self.last_changed_at.elapsed()) > self.group_interval
+        {
             self.version += 1;
         }
 
@@ -98,13 +126,16 @@ where
     pub fn push(&mut self, item: I) {
         let version = self.inc_version();
 
+        // A new edit creates a new history branch. Replaying redos captured
+        // against the abandoned document state would apply stale ranges.
+        self.redos.clear();
+
         if self.undos.len() >= self.max_undos {
             self.undos.remove(0);
         }
 
         if self.unique {
             self.undos.retain(|c| *c != item);
-            self.redos.retain(|c| *c != item);
         }
 
         let mut item = item;
@@ -227,17 +258,7 @@ mod tests {
 
         history.push(5.into());
 
-        let changes = history.redo().unwrap();
-        assert_eq!(changes[0].tab_index, 2);
-
-        let changes = history.redo().unwrap();
-        assert_eq!(changes[0].tab_index, 1);
-
-        let changes = history.undo().unwrap();
-        assert_eq!(changes[0].tab_index, 1);
-
-        let changes = history.undo().unwrap();
-        assert_eq!(changes[0].tab_index, 2);
+        assert!(history.redo().is_none());
 
         let changes = history.undo().unwrap();
         assert_eq!(changes[0].tab_index, 5);
@@ -277,27 +298,56 @@ mod tests {
         history.push(2.into());
 
         assert_eq!(history.undos().len(), 2);
-        assert_eq!(history.redos().len(), 1);
-
-        // Redo the last undone change
-        let changes = history.redo().unwrap();
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].tab_index, 1);
+        assert!(history.redos().is_empty());
+        assert!(history.redo().is_none());
 
         // Push another item
         history.push(3.into());
 
         // Check the version and undo stack
         assert_eq!(history.version(), 7);
-        assert_eq!(history.undos().len(), 4);
+        assert_eq!(history.undos().len(), 3);
 
         // Undo all changes
-        for _ in 0..4 {
+        for _ in 0..3 {
             history.undo();
         }
 
         // Check the undo stack is empty and redo stack has all changes
         assert_eq!(history.undos().len(), 0);
-        assert_eq!(history.redos().len(), 4);
+        assert_eq!(history.redos().len(), 3);
+    }
+
+    #[test]
+    fn explicit_transaction_groups_edits_and_isolates_surrounding_changes() {
+        let mut history: History<TabIndex> = History::new();
+        history.push(0.into());
+
+        history.start_transaction();
+        history.push(1.into());
+        history.start_transaction();
+        history.push(2.into());
+        history.end_transaction();
+        history.end_transaction();
+
+        history.push(3.into());
+
+        let after = history.undo().unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].tab_index, 3);
+
+        let transaction = history.undo().unwrap();
+        assert_eq!(transaction.len(), 2);
+        assert_eq!(
+            transaction
+                .into_iter()
+                .map(|change| change.tab_index)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+
+        let before = history.undo().unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].tab_index, 0);
     }
 }

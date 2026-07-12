@@ -2624,6 +2624,17 @@ impl InputState {
         self.silent_replace_text = false;
     }
 
+    /// Start a group of editor mutations that must undo as one operation and
+    /// remain isolated from typing immediately before and after it.
+    pub(crate) fn start_undo_transaction(&mut self) {
+        self.history.start_transaction();
+    }
+
+    /// Finish the active editor undo transaction.
+    pub(crate) fn end_undo_transaction(&mut self) {
+        self.history.end_transaction();
+    }
+
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
     /// Used only on initial load or language changes.
     pub(super) fn update_fold_candidates(&mut self) {
