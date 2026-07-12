@@ -1,11 +1,15 @@
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+};
 
-use super::TabSize;
+use super::{TabSize, snippet_transform::SnippetTransform};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnippetTabstop {
     pub(crate) index: u32,
     pub(crate) ranges: Vec<Range<usize>>,
+    transforms: Vec<Option<SnippetTransform>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -198,6 +202,7 @@ impl SnippetSession {
                     .iter()
                     .map(|range| insertion_start + range.start..insertion_start + range.end)
                     .collect(),
+                transforms: tabstop.transforms.clone(),
             })
             .collect::<Vec<_>>();
         (!tabstops.is_empty()).then_some(Self {
@@ -218,6 +223,26 @@ impl SnippetSession {
             .get(self.active)
             .and_then(|tabstop| tabstop.ranges.get(1..))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn active_mirror_replacements(&self, value: &str) -> Vec<(Range<usize>, String)> {
+        let Some(tabstop) = self.tabstops.get(self.active) else {
+            return Vec::new();
+        };
+        tabstop
+            .ranges
+            .iter()
+            .skip(1)
+            .cloned()
+            .zip(tabstop.transforms.iter().skip(1))
+            .map(|(range, transform)| {
+                let replacement = transform
+                    .as_ref()
+                    .map(|transform| transform.apply(value))
+                    .unwrap_or_else(|| value.to_string());
+                (range, replacement)
+            })
+            .collect()
     }
 
     pub(crate) fn active_is_final(&self) -> bool {
@@ -293,25 +318,55 @@ fn track_range(range: &mut Range<usize>, edit: &Range<usize>, inserted_len: usiz
 }
 
 pub(crate) fn parse_snippet(source: &str) -> ParsedSnippet {
-    let mut parser = Parser {
-        source,
-        offset: 0,
-        text: String::with_capacity(source.len()),
-        ranges: BTreeMap::new(),
-        defaults: BTreeMap::new(),
+    const MAX_DEFAULT_RESOLUTION_PASSES: usize = 16;
+
+    let mut defaults = BTreeMap::new();
+    let mut pass = 0;
+    let parser = loop {
+        let mut candidate = Parser {
+            source,
+            offset: 0,
+            text: String::with_capacity(source.len()),
+            ranges: BTreeMap::new(),
+            transforms: BTreeMap::new(),
+            defaults: defaults.clone(),
+            defined_defaults: HashSet::new(),
+        };
+        candidate.parse_until(None);
+        pass += 1;
+        if candidate.defaults == defaults || pass >= MAX_DEFAULT_RESOLUTION_PASSES {
+            break candidate;
+        }
+        defaults = candidate.defaults.clone();
     };
-    parser.parse_until(None);
-    let mut tabstops = parser
-        .ranges
+    let Parser {
+        text,
+        ranges,
+        mut transforms,
+        ..
+    } = parser;
+    let mut tabstops = ranges
         .into_iter()
-        .map(|(index, ranges)| SnippetTabstop { index, ranges })
+        .map(|(index, ranges)| {
+            let transforms = transforms
+                .remove(&index)
+                .unwrap_or_else(|| vec![None; ranges.len()]);
+            let mut occurrences = ranges.into_iter().zip(transforms).collect::<Vec<_>>();
+            // This editor owns one selection and updates mirrors itself. Keep
+            // a normal placeholder as the editable primary even when a
+            // transformed occurrence appeared first in the snippet source.
+            occurrences.sort_by_key(|(_, transform)| transform.is_some());
+            let (ranges, transforms) = occurrences.into_iter().unzip();
+            SnippetTabstop {
+                index,
+                ranges,
+                transforms,
+            }
+        })
         .collect::<Vec<_>>();
     // LSP/VS Code semantics always visit $0 last.
     tabstops.sort_by_key(|tabstop| (tabstop.index == 0, tabstop.index));
-    ParsedSnippet {
-        text: parser.text,
-        tabstops,
-    }
+    ParsedSnippet { text, tabstops }
 }
 
 struct Parser<'a> {
@@ -319,7 +374,9 @@ struct Parser<'a> {
     offset: usize,
     text: String,
     ranges: BTreeMap<u32, Vec<Range<usize>>>,
+    transforms: BTreeMap<u32, Vec<Option<SnippetTransform>>>,
     defaults: BTreeMap<u32, String>,
+    defined_defaults: HashSet<u32>,
 }
 
 impl Parser<'_> {
@@ -395,16 +452,15 @@ impl Parser<'_> {
                 let output_start = self.text.len();
                 self.parse_until(Some(b'}'));
                 let output_end = self.text.len();
-                self.defaults
-                    .entry(index)
-                    .or_insert_with(|| self.text[output_start..output_end].to_string());
-                self.ranges
-                    .entry(index)
-                    .or_default()
-                    .push(output_start..output_end);
+                if self.defined_defaults.insert(index) {
+                    self.defaults
+                        .insert(index, self.text[output_start..output_end].to_string());
+                }
+                self.record_tabstop(index, output_start..output_end, None);
                 true
             }
             Some(b'|') => self.parse_choice(index, start),
+            Some(b'/') => self.parse_transform(index, start),
             _ => {
                 self.offset = start;
                 false
@@ -435,17 +491,92 @@ impl Parser<'_> {
                 let output_start = self.text.len();
                 self.text.push_str(&first);
                 let output_end = self.text.len();
-                self.defaults.entry(index).or_insert(first);
-                self.ranges
-                    .entry(index)
-                    .or_default()
-                    .push(output_start..output_end);
+                if self.defined_defaults.insert(index) {
+                    self.defaults.insert(index, first);
+                }
+                self.record_tabstop(index, output_start..output_end, None);
                 return true;
             }
             self.offset += 1;
         }
         self.offset = start;
         false
+    }
+
+    fn parse_transform(&mut self, index: u32, start: usize) -> bool {
+        self.offset += 1;
+        let Some(pattern) = self.take_transform_section(false) else {
+            self.offset = start;
+            return false;
+        };
+        let Some(format) = self.take_transform_section(true) else {
+            self.offset = start;
+            return false;
+        };
+        let options_start = self.offset;
+        while self.offset < self.source.len() && self.peek() != Some(b'}') {
+            self.offset += self.source[self.offset..]
+                .chars()
+                .next()
+                .unwrap()
+                .len_utf8();
+        }
+        if self.peek() != Some(b'}') {
+            self.offset = start;
+            return false;
+        }
+        let options = &self.source[options_start..self.offset];
+        self.offset += 1;
+        let Some(transform) = SnippetTransform::parse(&pattern, &format, options) else {
+            self.offset = start;
+            return false;
+        };
+
+        let value = self.defaults.get(&index).cloned().unwrap_or_default();
+        let transformed = transform.apply(&value);
+        let output_start = self.text.len();
+        self.text.push_str(&transformed);
+        let output_end = self.text.len();
+        self.record_tabstop(index, output_start..output_end, Some(transform));
+        true
+    }
+
+    fn take_transform_section(&mut self, format: bool) -> Option<String> {
+        let mut value = String::new();
+        let mut brace_depth = 0usize;
+        while self.offset < self.source.len() {
+            let character = self.source[self.offset..].chars().next()?;
+            self.offset += character.len_utf8();
+            if format && character == '{' && value.ends_with('$') {
+                brace_depth += 1;
+                value.push(character);
+                continue;
+            }
+            if format && character == '}' && brace_depth > 0 {
+                brace_depth -= 1;
+                value.push(character);
+                continue;
+            }
+            if character == '/' && brace_depth == 0 {
+                return Some(value);
+            }
+            if character != '\\' {
+                value.push(character);
+                continue;
+            }
+
+            let Some(escaped) = self.source[self.offset..].chars().next() else {
+                return None;
+            };
+            self.offset += escaped.len_utf8();
+            if escaped == '/' || (format && escaped == '\\') {
+                value.push(escaped);
+            } else {
+                value.push('\\');
+                value.push(escaped);
+            }
+        }
+        None
     }
 
     fn parse_braced_variable(&mut self, name: &str, start: usize) -> bool {
@@ -500,10 +631,17 @@ impl Parser<'_> {
             self.text.push_str(value);
         }
         let output_end = self.text.len();
-        self.ranges
-            .entry(index)
-            .or_default()
-            .push(output_start..output_end);
+        self.record_tabstop(index, output_start..output_end, None);
+    }
+
+    fn record_tabstop(
+        &mut self,
+        index: u32,
+        range: Range<usize>,
+        transform: Option<SnippetTransform>,
+    ) {
+        self.ranges.entry(index).or_default().push(range);
+        self.transforms.entry(index).or_default().push(transform);
     }
 
     fn parse_number(&mut self) -> Option<u32> {
@@ -580,14 +718,17 @@ mod tests {
                 SnippetTabstop {
                     index: 1,
                     ranges: vec![3..7, 17..21],
+                    transforms: vec![None, None],
                 },
                 SnippetTabstop {
                     index: 2,
                     ranges: vec![8..13, 22..27],
+                    transforms: vec![None, None],
                 },
                 SnippetTabstop {
                     index: 0,
                     ranges: vec![31..31],
+                    transforms: vec![None],
                 },
             ]
         );
@@ -600,6 +741,36 @@ mod tests {
         assert_eq!(parsed.tabstops[0].ranges, vec![0..11]);
         assert_eq!(parsed.tabstops[1].ranges, vec![6..11]);
         assert_eq!(parsed.tabstops[2].ranges, vec![18..21]);
+    }
+
+    #[test]
+    fn parses_textmate_transforms_and_keeps_plain_placeholder_primary() {
+        let parsed = parse_snippet("${1:hello-world} ${1/(.*)/${1:/camelcase}/}$0");
+        assert_eq!(parsed.text, "hello-world helloWorld");
+        assert_eq!(parsed.tabstops[0].ranges, vec![0..11, 12..22]);
+        assert!(parsed.tabstops[0].transforms[0].is_none());
+        assert!(parsed.tabstops[0].transforms[1].is_some());
+        assert_eq!(parsed.tabstops[1].ranges, vec![22..22]);
+
+        let session = SnippetSession::new(&parsed, 5).unwrap();
+        assert_eq!(
+            session.active_mirror_replacements("new value"),
+            vec![(17..27, "newValue".to_string())]
+        );
+    }
+
+    #[test]
+    fn resolves_transforms_and_mirrors_declared_before_their_defaults() {
+        let transformed_first = parse_snippet("${1/(.*)/${1:/upcase}/} ${1:name}$0");
+        assert_eq!(transformed_first.text, "NAME name");
+        assert_eq!(transformed_first.tabstops[0].ranges, vec![5..9, 0..4]);
+        assert!(transformed_first.tabstops[0].transforms[0].is_none());
+        assert!(transformed_first.tabstops[0].transforms[1].is_some());
+
+        let forward_chain = parse_snippet("$1 ${1:$2} ${2:value}$0");
+        assert_eq!(forward_chain.text, "value value value");
+        assert_eq!(forward_chain.tabstops[0].ranges, vec![0..5, 6..11]);
+        assert_eq!(forward_chain.tabstops[1].ranges, vec![6..11, 12..17]);
     }
 
     #[test]

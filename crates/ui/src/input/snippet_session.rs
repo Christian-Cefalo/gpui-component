@@ -87,22 +87,22 @@ impl InputState {
             return false;
         }
         let value = self.text.slice(primary).to_string();
-        let mut mirrors = session.active_mirrors().to_vec();
-        mirrors.sort_by_key(|range| (range.start, range.end));
+        let mut mirrors = session.active_mirror_replacements(&value);
+        mirrors.sort_by_key(|(range, _)| (range.start, range.end));
         self.snippet_tracking_suspended = true;
-        for mirror in mirrors.into_iter().rev() {
+        for (mirror, replacement) in mirrors.into_iter().rev() {
             if mirror.end > self.text.len() {
                 self.snippet_tracking_suspended = false;
                 self.snippet_session = None;
                 return false;
             }
-            if self.text.slice(mirror.clone()).to_string() == value {
+            if self.text.slice(mirror.clone()).to_string() == replacement {
                 continue;
             }
             let range_utf16 = self.range_to_utf16(&mirror);
-            self.replace_text_in_range_silent(Some(range_utf16), &value, window, cx);
+            self.replace_text_in_range_silent(Some(range_utf16), &replacement, window, cx);
             if let Some(session) = self.snippet_session.as_mut() {
-                session.track_edit(mirror, value.len());
+                session.track_edit(mirror, replacement.len());
             }
         }
         self.snippet_tracking_suspended = false;

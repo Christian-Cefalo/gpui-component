@@ -3258,6 +3258,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn lsp_snippet_session_recomputes_transformed_mirrors(cx: &mut TestAppContext) {
+        use crate::input::{IndentInline, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1:name} = ${1/(.*)/${1:/upcase}/};$0");
+        assert_eq!(snippet.text, "name = NAME;");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(snippet.text.clone(), window, cx);
+                state.start_snippet_session(&snippet, 0, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 4));
+
+                let selected_utf16 = state.range_to_utf16(&(0..4));
+                state.replace_text_in_range(Some(selected_utf16), "item", window, cx);
+                assert_eq!(state.value(), "item = ITEM;");
+
+                state.indent_inline(&IndentInline, window, cx);
+                assert_eq!(state.selected_range, Selection::new(12, 12));
+                assert!(state.snippet_session.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
     fn test_highlighting_preserved_after_fold(cx: &mut TestAppContext) {
         use crate::highlighter::HighlightTheme;
         use crate::input::display_map::FoldRange;

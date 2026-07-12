@@ -95,6 +95,7 @@ tree-sitter-zig = ["dep:tree-sitter-zig"]
 
 [dependencies]
 anyhow.workspace = true
+fancy-regex.workspace = true
 gpui = { workspace = true }
 gpui_macros.workspace = true
 gpui-component-macros = { workspace = true }
