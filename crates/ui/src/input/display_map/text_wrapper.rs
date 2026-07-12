@@ -934,6 +934,8 @@ mod tests {
             visible_range_offset: 0..0,
             lines: Rc::new(vec![]),
             line_height: px(20.),
+            code_lens_height: px(0.),
+            code_lens_lines: vec![],
             wrap_width: None,
             line_number_width: px(0.),
             cursor_bounds: None,

@@ -6,14 +6,15 @@ use gpui::{
 };
 use gpui::{
     HighlightStyle, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, LayoutId,
-    MouseButton, MouseMoveEvent, MouseUpEvent, Path, Pixels, Point, Position, ShapedLine,
-    SharedString, Size, Style, Styled as _, TextAlign, TextRun, TextStyle, UnderlineStyle, Window,
-    fill, point, px, relative, size,
+    MouseButton, MouseMoveEvent, MouseUpEvent, ParentElement as _, Path, Pixels, Point, Position,
+    ShapedLine, SharedString, Size, Style, Styled as _, TextAlign, TextRun, TextStyle,
+    UnderlineStyle, Window, div, fill, point, px, relative, size,
 };
 use ropey::Rope;
 use smallvec::SmallVec;
 use std::{ops::Range, rc::Rc};
 
+use crate::link::Link;
 use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -392,6 +393,10 @@ impl TextElement {
         let mut vi = 0; // index into visible_buffer_lines / lines
         for (ix, wrap_line) in buffer_lines.iter().enumerate() {
             let row = ix;
+            let visible_wrap_rows = state.display_map.visible_wrap_row_count_for_buffer_line(ix);
+            if visible_wrap_rows > 0 {
+                offset_y += last_layout.code_lens_height_before(row);
+            }
             let line_origin = point(px(0.), offset_y);
 
             // break loop if all cursor positions are found
@@ -448,8 +453,6 @@ impl TextElement {
                     cursor_end = Some(line_origin);
                 }
 
-                let visible_wrap_rows =
-                    state.display_map.visible_wrap_row_count_for_buffer_line(ix);
                 offset_y += line_height * visible_wrap_rows;
                 // +1 for the last `\n`
                 prev_lines_offset += wrap_line.len() + 1;
@@ -600,14 +603,17 @@ impl TextElement {
         let mut line_corners = vec![];
 
         // Iterate only over visible (non-hidden) buffer lines
-        for (prev_lines_offset, line) in last_layout
+        for ((prev_lines_offset, line), &buffer_line) in last_layout
             .visible_line_byte_offsets
             .iter()
             .zip(lines.iter())
+            .zip(last_layout.visible_buffer_lines.iter())
         {
             let prev_lines_offset = *prev_lines_offset;
             let line_size = line.size(line_height);
             let line_wrap_width = line_size.width;
+
+            offset_y += last_layout.code_lens_height_before(buffer_line);
 
             let line_origin = point(px(0.), offset_y);
 
@@ -844,6 +850,7 @@ impl TextElement {
         &self,
         state: &InputState,
         line_height: Pixels,
+        code_lens_height: Pixels,
         input_height: Pixels,
     ) -> (Range<usize>, Vec<usize>, Pixels) {
         // Add extra rows to avoid showing empty space when scroll to bottom.
@@ -861,10 +868,22 @@ impl TextElement {
         };
 
         let mut visible_range = 0..total_lines;
+        let code_lens_count = state
+            .lsp
+            .code_lens_lines()
+            .into_iter()
+            .filter(|&line| {
+                state
+                    .display_map
+                    .visible_wrap_row_count_for_buffer_line(line)
+                    > 0
+            })
+            .count();
+        let content_height = line_height * total_lines + code_lens_height * code_lens_count;
         scroll_top = clamp_auto_grow_vertical_scroll_offset(
             &state.mode,
             scroll_top,
-            line_height * total_lines,
+            content_height,
             input_height,
         );
         let mut line_bottom = px(0.);
@@ -876,10 +895,16 @@ impl TextElement {
             }
 
             let wrapped_height = line_height * visible_wrap_rows;
-            line_bottom += wrapped_height;
+            let lens_height = if state.lsp.has_code_lens_on_line(ix) {
+                code_lens_height
+            } else {
+                px(0.)
+            };
+            let row_height = lens_height + wrapped_height;
+            line_bottom += row_height;
 
             if line_bottom < -scroll_top {
-                visible_top = line_bottom - wrapped_height;
+                visible_top = line_bottom - row_height;
                 visible_range.start = ix;
             }
 
@@ -1137,6 +1162,7 @@ impl TextElement {
                 .iter()
                 .zip(last_layout.visible_buffer_lines.iter())
             {
+                offset_y += last_layout.code_lens_height_before(buffer_line);
                 if state.display_map.is_fold_candidate(buffer_line) {
                     let is_folded = state.display_map.is_folded_at(buffer_line);
                     infos.push(FoldInfo {
@@ -1212,6 +1238,105 @@ impl TextElement {
         }
 
         icon_layout
+    }
+
+    /// Create one compact, interactive view zone above each visible buffer
+    /// line that owns CodeLens items. All command titles for a line share the
+    /// zone and are separated like VS Code's `title | title` presentation.
+    fn layout_code_lenses(
+        &self,
+        bounds: &Bounds<Pixels>,
+        last_layout: &LastLayout,
+        text_size: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let mut rows = Vec::new();
+        let mut offset_y = last_layout.visible_top;
+        let lens_font_size = text_size * 0.9;
+
+        for (line, &buffer_line) in last_layout
+            .lines
+            .iter()
+            .zip(last_layout.visible_buffer_lines.iter())
+        {
+            let lens_height = last_layout.code_lens_height_before(buffer_line);
+            if lens_height > px(0.) {
+                let lenses = self.state.read(cx).lsp.code_lenses_on_line(buffer_line);
+                let mut row = div()
+                    .id(("code-lens-row", buffer_line))
+                    .flex()
+                    .items_center()
+                    .h(lens_height)
+                    .pl(px(4.))
+                    .overflow_hidden()
+                    .text_size(lens_font_size)
+                    .text_color(cx.theme().muted_foreground)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        // A CodeLens view zone is not part of the buffer. A
+                        // click on its padding or unresolved placeholder must
+                        // never move the caret into the attached source line.
+                        cx.stop_propagation();
+                    });
+
+                for (position, display) in lenses.into_iter().enumerate() {
+                    if position > 0 {
+                        row = row.child(
+                            div()
+                                .px(px(4.))
+                                .text_color(cx.theme().muted_foreground)
+                                .child("|"),
+                        );
+                    }
+
+                    if let Some(title) = display.title {
+                        let input_state = self.state.clone();
+                        let line = display.line;
+                        let index = display.index;
+                        row = row.child(
+                            Link::new(format!("code-lens-{line}-{index}"))
+                                .text_size(lens_font_size)
+                                .text_color(cx.theme().muted_foreground)
+                                .on_click(move |_, window, cx| {
+                                    let _ = input_state.update(cx, |state, cx| {
+                                        state.execute_code_lens_at(line, index, window, cx)
+                                    });
+                                })
+                                .child(title),
+                        );
+                    } else {
+                        // Preserve the view zone while the server resolves the
+                        // item so text does not jump between frames.
+                        row = row.child(
+                            div()
+                                .text_color(cx.theme().muted_foreground.opacity(0.65))
+                                .child("…"),
+                        );
+                    }
+                }
+
+                let mut row = row.into_any_element();
+                row.prepaint_as_root(
+                    point(
+                        bounds.origin.x + last_layout.line_number_width,
+                        bounds.origin.y + offset_y,
+                    ),
+                    size(
+                        (bounds.size.width - last_layout.line_number_width).max(px(0.)),
+                        lens_height,
+                    )
+                    .into(),
+                    window,
+                    cx,
+                );
+                rows.push(row);
+                offset_y += lens_height;
+            }
+
+            offset_y += line.size(last_layout.line_height).height;
+        }
+
+        rows
     }
 
     /// Paint fold icons using prepaint hitboxes.
@@ -1480,6 +1605,8 @@ pub(super) struct PrepaintState {
     bounds: Bounds<Pixels>,
     /// Fold icon layout data
     fold_icon_layout: FoldIconLayout,
+    /// Prepainted interactive CodeLens rows.
+    code_lens_layout: Vec<AnyElement>,
     // Inline completion rendering data
     /// Shaped ghost lines to paint after cursor row (completion lines 2+)
     ghost_lines: Vec<ShapedLine>,
@@ -1646,9 +1773,12 @@ impl Element for TextElement {
 
         let state = self.state.read(cx);
         let line_height = window.line_height();
+        // Match VS Code's compact above-line CodeLens view zone: smaller than
+        // a normal editor row, but tall enough for an accessible click target.
+        let code_lens_height = (text_size * 1.17).min(line_height);
 
         let (visible_range, visible_buffer_lines, visible_top) =
-            self.calculate_visible_range(&state, line_height, bounds.size.height);
+            self.calculate_visible_range(&state, line_height, code_lens_height, bounds.size.height);
         let visible_start_offset = state.text.line_start_offset(visible_range.start);
         let visible_end_offset = state
             .text
@@ -1685,6 +1815,18 @@ impl Element for TextElement {
             )
         };
 
+        let code_lens_lines = state
+            .lsp
+            .code_lens_lines()
+            .into_iter()
+            .filter(|&line| {
+                state
+                    .display_map
+                    .visible_wrap_row_count_for_buffer_line(line)
+                    > 0
+            })
+            .collect();
+
         let mut last_layout = LastLayout {
             visible_range,
             visible_buffer_lines,
@@ -1692,6 +1834,8 @@ impl Element for TextElement {
             visible_top,
             visible_range_offset,
             line_height,
+            code_lens_height,
+            code_lens_lines,
             wrap_width,
             line_number_width,
             lines: Rc::new(vec![]),
@@ -1850,6 +1994,7 @@ impl Element for TextElement {
                 longest_line_width
             },
             (total_wrapped_lines as f32 * line_height
+                + last_layout.code_lens_height * last_layout.code_lens_lines.len()
                 + empty_bottom_height.max(ghost_lines_height))
             .max(bounds.size.height),
         );
@@ -1974,6 +2119,8 @@ impl Element for TextElement {
             )));
         let fold_icon_layout =
             self.layout_fold_icons(original_x, &bounds, &last_layout, window, cx);
+        let code_lens_layout =
+            self.layout_code_lenses(&bounds, &last_layout, text_size, window, cx);
 
         PrepaintState {
             bounds,
@@ -1991,6 +2138,7 @@ impl Element for TextElement {
             document_highlight_paths,
             indent_guides_path,
             fold_icon_layout,
+            code_lens_layout,
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
@@ -2077,6 +2225,7 @@ impl Element for TextElement {
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
+                offset_y += prepaint.last_layout.code_lens_height_before(buffer_line);
                 let is_active = prepaint.current_row == Some(buffer_line);
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let height = line_height * lines.len() as f32;
@@ -2137,6 +2286,13 @@ impl Element for TextElement {
             window.paint_path(path.clone(), color);
         }
 
+        // Paint CodeLens view zones before the editor text. Their links own
+        // mouse hitboxes and stop propagation so activating a lens never also
+        // moves the caret.
+        for row in prepaint.code_lens_layout.iter_mut() {
+            row.paint(window, cx);
+        }
+
         // Paint text with inline completion ghost line support
         let mut offset_y = invisible_top_padding;
         let ghost_lines = &prepaint.ghost_lines;
@@ -2163,6 +2319,7 @@ impl Element for TextElement {
             .zip(prepaint.last_layout.visible_buffer_lines.iter())
         {
             let row = buffer_line;
+            offset_y += prepaint.last_layout.code_lens_height_before(row);
             let line_y = origin.y + offset_y;
             let p = point(
                 origin.x + prepaint.last_layout.line_number_width + (scroll_offset),
@@ -2252,6 +2409,7 @@ impl Element for TextElement {
                 .iter()
                 .zip(prepaint.last_layout.visible_buffer_lines.iter())
             {
+                offset_y += prepaint.last_layout.code_lens_height_before(buffer_line);
                 let p = point(input_bounds.origin.x, origin.y + offset_y);
                 let is_active = prepaint.current_row == Some(buffer_line);
 
@@ -2304,6 +2462,7 @@ impl Element for TextElement {
             state.update_scroll_offset(Some(prepaint.cursor_scroll_offset), cx);
             state.deferred_scroll_offset = None;
             state.refresh_inlay_hints(visible_rows, window, cx);
+            state.refresh_code_lenses(prepaint.last_layout.visible_range.clone(), window, cx);
 
             cx.notify();
         });

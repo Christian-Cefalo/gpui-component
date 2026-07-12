@@ -133,6 +133,7 @@ impl TextElement {
             .iter()
             .zip(last_layout.lines.iter())
         {
+            offset_y += last_layout.code_lens_height_before(buffer_line);
             let line = state.text.slice_line(buffer_line);
             let mut current_indents = vec![];
             if line.len() > 0 {

@@ -6,6 +6,7 @@ use std::rc::Rc;
 use crate::input::{InputState, RopeExt, Selection, popovers::ContextMenu};
 
 mod code_actions;
+mod code_lens;
 mod completions;
 mod definitions;
 mod document_colors;
@@ -18,6 +19,7 @@ mod selection_ranges;
 mod semantic_tokens;
 
 pub use code_actions::*;
+pub use code_lens::*;
 pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
@@ -39,6 +41,8 @@ pub struct Lsp {
     pub completion_insert_mode: CompletionInsertMode,
     /// The code action providers.
     pub code_action_providers: Vec<Rc<dyn CodeActionProvider>>,
+    /// The document CodeLens provider.
+    pub code_lens_provider: Option<Rc<dyn CodeLensProvider>>,
     /// The hover provider.
     pub hover_provider: Option<Rc<dyn HoverProvider>>,
     /// The definition provider.
@@ -58,6 +62,10 @@ pub struct Lsp {
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<lsp_types::DocumentHighlight>,
+    code_lenses: Vec<lsp_types::CodeLens>,
+    code_lens_generation: u64,
+    code_lens_requested_generation: Option<u64>,
+    code_lens_resolve_attempted: Vec<bool>,
     pub(super) folding_ranges: Vec<crate::input::display_map::FoldRange>,
     inlay_hints: Vec<lsp_types::InlayHint>,
     inlay_hint_range: Option<lsp_types::Range>,
@@ -70,6 +78,9 @@ pub struct Lsp {
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
+    _code_lens_task: Task<()>,
+    _code_lens_resolve_task: Task<()>,
+    _code_lens_command_task: Task<Result<()>>,
     _folding_range_task: Task<()>,
     _inlay_hint_task: Task<()>,
     _selection_range_task: Task<()>,
@@ -82,6 +93,7 @@ impl Default for Lsp {
             completion_provider: None,
             completion_insert_mode: CompletionInsertMode::default(),
             code_action_providers: vec![],
+            code_lens_provider: None,
             hover_provider: None,
             definition_provider: None,
             document_color_provider: None,
@@ -92,6 +104,10 @@ impl Default for Lsp {
             semantic_tokens_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
+            code_lenses: vec![],
+            code_lens_generation: 0,
+            code_lens_requested_generation: None,
+            code_lens_resolve_attempted: vec![],
             folding_ranges: Vec::new(),
             inlay_hints: vec![],
             inlay_hint_range: None,
@@ -101,6 +117,9 @@ impl Default for Lsp {
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
+            _code_lens_task: Task::ready(()),
+            _code_lens_resolve_task: Task::ready(()),
+            _code_lens_command_task: Task::ready(Ok(())),
             _folding_range_task: Task::ready(()),
             _inlay_hint_task: Task::ready(()),
             _selection_range_task: Task::ready(()),
@@ -119,6 +138,7 @@ impl Lsp {
     ) {
         self.inlay_hint_range = None;
         self.inlay_hints.clear();
+        self.invalidate_code_lenses();
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.folding_ranges.clear();
@@ -131,6 +151,10 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
         self.document_highlights.clear();
+        self.code_lenses.clear();
+        self.code_lens_generation = self.code_lens_generation.wrapping_add(1);
+        self.code_lens_requested_generation = None;
+        self.code_lens_resolve_attempted.clear();
         self.folding_ranges.clear();
         self.inlay_hints.clear();
         self.inlay_hint_range = None;
@@ -140,6 +164,9 @@ impl Lsp {
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
+        self._code_lens_task = Task::ready(());
+        self._code_lens_resolve_task = Task::ready(());
+        self._code_lens_command_task = Task::ready(Ok(()));
         self._folding_range_task = Task::ready(());
         self._inlay_hint_task = Task::ready(());
         self._selection_range_task = Task::ready(());

@@ -323,6 +323,10 @@ pub(super) struct LastLayout {
     pub(super) lines: Rc<Vec<LineLayout>>,
     /// The line_height of text layout, this will change will InputElement painted.
     pub(super) line_height: Pixels,
+    /// Height reserved for one CodeLens view zone above a buffer line.
+    pub(super) code_lens_height: Pixels,
+    /// Sorted buffer lines that currently own a visible CodeLens view zone.
+    pub(super) code_lens_lines: Vec<usize>,
     /// The wrap width of text layout, this will change will InputElement painted.
     pub(super) wrap_width: Option<Pixels>,
     /// The line number area width of text layout, if not line number, this will be 0px.
@@ -343,6 +347,20 @@ impl LastLayout {
     pub(crate) fn line(&self, row: usize) -> Option<&LineLayout> {
         let pos = self.visible_buffer_lines.binary_search(&row).ok()?;
         self.lines.get(pos)
+    }
+
+    #[inline]
+    pub(super) fn has_code_lens_on_line(&self, row: usize) -> bool {
+        self.code_lens_lines.binary_search(&row).is_ok()
+    }
+
+    #[inline]
+    pub(super) fn code_lens_height_before(&self, row: usize) -> Pixels {
+        if self.has_code_lens_on_line(row) {
+            self.code_lens_height
+        } else {
+            px(0.)
+        }
     }
 
     /// Get the alignment offset for the given line width.
@@ -802,7 +820,13 @@ impl InputState {
         let line_height = last_layout.line_height;
 
         let mut y_offset = last_layout.visible_top;
-        for (vi, line) in last_layout.lines.iter().enumerate() {
+        for (vi, (line, &buffer_line)) in last_layout
+            .lines
+            .iter()
+            .zip(last_layout.visible_buffer_lines.iter())
+            .enumerate()
+        {
+            y_offset += last_layout.code_lens_height_before(buffer_line);
             let prev_lines_offset = last_layout.visible_line_byte_offsets[vi];
             let local_offset = offset.saturating_sub(prev_lines_offset);
             if let Some(pos) = line.position_for_index(local_offset, last_layout, false) {
@@ -1976,12 +2000,16 @@ impl InputState {
         let mut row_offset_y = px(0.);
         for (ix, _wrap_line) in self.display_map.lines().iter().enumerate() {
             if ix == row {
+                row_offset_y += last_layout.code_lens_height_before(ix);
                 break;
             }
 
             // Only accumulate height for visible (non-folded) wrap rows
             let visible_wrap_rows = self.display_map.visible_wrap_row_count_for_buffer_line(ix);
-            row_offset_y += line_height * visible_wrap_rows;
+            if visible_wrap_rows > 0 {
+                row_offset_y += last_layout.code_lens_height_before(ix);
+                row_offset_y += line_height * visible_wrap_rows;
+            }
         }
 
         // For Right alignment use 0 margin: the cursor indicator is clamped inside bounds
@@ -2209,6 +2237,13 @@ impl InputState {
             .enumerate()
         {
             let line_start_offset = last_layout.visible_line_byte_offsets[vi];
+
+            let code_lens_height =
+                last_layout.code_lens_height_before(last_layout.visible_buffer_lines[vi]);
+            if inner_position.y < y_offset + code_lens_height {
+                return line_start_offset;
+            }
+            y_offset += code_lens_height;
 
             // Calculate line origin for this display row
             let line_origin = point(px(0.), y_offset);
@@ -3104,10 +3139,17 @@ impl EntityInputHandler for InputState {
         let line_number_origin = point(line_number_width, px(0.));
         let mut y_offset = last_layout.visible_top;
 
-        for (vi, line) in last_layout.lines.iter().enumerate() {
+        for (vi, (line, &buffer_line)) in last_layout
+            .lines
+            .iter()
+            .zip(last_layout.visible_buffer_lines.iter())
+            .enumerate()
+        {
             if start_origin.is_some() && end_origin.is_some() {
                 break;
             }
+
+            y_offset += last_layout.code_lens_height_before(buffer_line);
 
             let index_offset = last_layout.visible_line_byte_offsets[vi];
 
@@ -3154,12 +3196,25 @@ impl EntityInputHandler for InputState {
     ) -> Option<usize> {
         let last_layout = self.last_layout.as_ref()?;
         let line_point = self.last_bounds?.localize(&point)?;
+        let mut y_offset = last_layout.visible_top;
 
-        for (vi, line) in last_layout.lines.iter().enumerate() {
+        for (vi, (line, &buffer_line)) in last_layout
+            .lines
+            .iter()
+            .zip(last_layout.visible_buffer_lines.iter())
+            .enumerate()
+        {
+            let code_lens_height = last_layout.code_lens_height_before(buffer_line);
             let offset = last_layout.visible_line_byte_offsets[vi];
-            if let Some(utf8_index) = line.index_for_position(line_point, last_layout) {
+            if line_point.y < y_offset + code_lens_height {
+                return Some(self.offset_to_utf16(offset));
+            }
+            y_offset += code_lens_height;
+            let local_point = line_point - gpui::point(px(0.), y_offset);
+            if let Some(utf8_index) = line.index_for_position(local_point, last_layout) {
                 return Some(self.offset_to_utf16(offset + utf8_index));
             }
+            y_offset += line.size(last_layout.line_height).height;
         }
 
         None
@@ -3203,8 +3258,10 @@ impl Render for InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::CodeLensProvider;
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
+    use lsp_types::{CodeLens, Command, Position as LspPosition, Range as LspRange};
 
     struct InputView {
         input: Entity<InputState>,
@@ -3242,6 +3299,83 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    struct StaticCodeLensProvider;
+
+    impl CodeLensProvider for StaticCodeLensProvider {
+        fn code_lenses(
+            &self,
+            _text: &Rope,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<CodeLens>>> {
+            Task::ready(Ok(vec![CodeLens {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 6)),
+                command: Some(Command {
+                    title: "Run second".to_string(),
+                    command: "test.run".to_string(),
+                    arguments: None,
+                }),
+                data: None,
+            }]))
+        }
+
+        fn execute_code_lens(
+            &self,
+            _text: &Rope,
+            _lens: CodeLens,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            Task::ready(Ok(()))
+        }
+    }
+
+    #[gpui::test]
+    fn code_lens_view_zone_offsets_text_and_mouse_mapping_together(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("first\nsecond", window, cx);
+                state.lsp.code_lens_provider = Some(Rc::new(StaticCodeLensProvider));
+                state.refresh_code_lenses(0..2, window, cx);
+            });
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(300));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, _| {
+                assert_eq!(state.code_lenses().len(), 1);
+                let layout = state.last_layout.as_ref().expect("painted layout");
+                assert!(layout.has_code_lens_on_line(1));
+                let first = state
+                    .line_and_position_for_offset(0)
+                    .2
+                    .expect("first line position");
+                let second_offset = state.text.line_start_offset(1);
+                let second = state
+                    .line_and_position_for_offset(second_offset)
+                    .2
+                    .expect("second line position");
+                assert_eq!(
+                    second.y - first.y,
+                    layout.line_height + layout.code_lens_height
+                );
+
+                let bounds = state.last_bounds.expect("editor bounds");
+                let lens_point = point(
+                    bounds.origin.x + layout.line_number_width + px(2.),
+                    bounds.origin.y + layout.line_height + layout.code_lens_height.half(),
+                );
+                assert_eq!(state.index_for_mouse_position(lens_point), second_offset);
+            });
+        });
     }
 
     #[gpui::test]
