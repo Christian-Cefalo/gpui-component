@@ -100,6 +100,8 @@ actions!(
         SelectToEnd,
         SelectToPreviousWordStart,
         SelectToNextWordEnd,
+        ExpandSelection,
+        ShrinkSelection,
         ShowCharacterPalette,
         Copy,
         Cut,
@@ -219,6 +221,14 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("alt-shift-right", SelectToNextWordEnd, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-right", SelectToNextWordEnd, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-shift-cmd-right", ExpandSelection, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-shift-cmd-left", ShrinkSelection, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("shift-alt-right", ExpandSelection, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("shift-alt-left", ShrinkSelection, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, Some(CONTEXT)),
         #[cfg(target_os = "macos")]

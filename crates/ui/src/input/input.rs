@@ -342,6 +342,8 @@ impl RenderOnce for Input {
             .on_action(window.listener_for(&self.state, InputState::select_to_end_of_line))
             .on_action(window.listener_for(&self.state, InputState::select_to_previous_word))
             .on_action(window.listener_for(&self.state, InputState::select_to_next_word))
+            .on_action(window.listener_for(&self.state, InputState::expand_selection))
+            .on_action(window.listener_for(&self.state, InputState::shrink_selection))
             .on_action(window.listener_for(&self.state, InputState::home))
             .on_action(window.listener_for(&self.state, InputState::end))
             .on_action(window.listener_for(&self.state, InputState::move_to_start))

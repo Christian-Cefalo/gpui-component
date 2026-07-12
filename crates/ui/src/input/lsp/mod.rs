@@ -3,7 +3,7 @@ use gpui::{App, Context, Hsla, MouseMoveEvent, SharedString, Task, Window};
 use ropey::Rope;
 use std::rc::Rc;
 
-use crate::input::{InputState, RopeExt, popovers::ContextMenu};
+use crate::input::{InputState, RopeExt, Selection, popovers::ContextMenu};
 
 mod code_actions;
 mod completions;
@@ -13,6 +13,7 @@ mod document_highlights;
 mod hover;
 mod inlay_hints;
 mod refresh;
+mod selection_ranges;
 mod semantic_tokens;
 
 pub use code_actions::*;
@@ -22,6 +23,7 @@ pub use document_colors::*;
 pub use document_highlights::*;
 pub use hover::*;
 pub use inlay_hints::*;
+pub use selection_ranges::*;
 pub use semantic_tokens::*;
 
 /// LSP ServerCapabilities
@@ -42,6 +44,8 @@ pub struct Lsp {
     pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
     /// The viewport inlay-hint provider.
     pub inlay_hint_provider: Option<Rc<dyn InlayHintProvider>>,
+    /// The smart expand-selection provider.
+    pub selection_range_provider: Option<Rc<dyn SelectionRangeProvider>>,
     /// The range semantic tokens provider.
     pub semantic_tokens_provider: Option<Rc<dyn DocumentRangeSemanticTokensProvider>>,
 
@@ -49,6 +53,8 @@ pub struct Lsp {
     document_highlights: Vec<lsp_types::DocumentHighlight>,
     inlay_hints: Vec<lsp_types::InlayHint>,
     inlay_hint_range: Option<lsp_types::Range>,
+    selection_range_history: Vec<Selection>,
+    selection_range_last: Option<Selection>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
@@ -57,6 +63,7 @@ pub struct Lsp {
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
     _inlay_hint_task: Task<()>,
+    _selection_range_task: Task<()>,
     _semantic_tokens_task: Task<()>,
 }
 
@@ -70,16 +77,20 @@ impl Default for Lsp {
             document_color_provider: None,
             document_highlight_provider: None,
             inlay_hint_provider: None,
+            selection_range_provider: None,
             semantic_tokens_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
             inlay_hints: vec![],
             inlay_hint_range: None,
+            selection_range_history: Vec::new(),
+            selection_range_last: None,
             semantic_tokens: vec![],
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
             _inlay_hint_task: Task::ready(()),
+            _selection_range_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
         }
     }
@@ -95,6 +106,8 @@ impl Lsp {
     ) {
         self.inlay_hint_range = None;
         self.inlay_hints.clear();
+        self.selection_range_history.clear();
+        self.selection_range_last = None;
         self.update_document_colors(text, window, cx);
         self.update_semantic_tokens(text, window, cx);
     }
@@ -105,11 +118,14 @@ impl Lsp {
         self.document_highlights.clear();
         self.inlay_hints.clear();
         self.inlay_hint_range = None;
+        self.selection_range_history.clear();
+        self.selection_range_last = None;
         self.semantic_tokens.clear();
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
         self._inlay_hint_task = Task::ready(());
+        self._selection_range_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
     }
 }
