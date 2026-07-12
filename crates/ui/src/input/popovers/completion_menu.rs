@@ -631,6 +631,11 @@ impl CompletionMenu {
         self.query = query.into();
     }
 
+    pub(crate) fn begin_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
+        self.trigger_start_offset = Some(start_offset);
+        self.query = query.into();
+    }
+
     pub(crate) fn show(
         &mut self,
         offset: usize,

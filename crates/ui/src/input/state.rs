@@ -116,6 +116,7 @@ actions!(
         MoveToPreviousWord,
         MoveToNextWord,
         Escape,
+        TriggerCompletion,
         ToggleCodeActions,
         Search,
         GoToDefinition,
@@ -190,6 +191,7 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
         KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
+        KeyBinding::new("ctrl-space", TriggerCompletion, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]

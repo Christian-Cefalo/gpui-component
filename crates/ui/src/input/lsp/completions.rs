@@ -1,5 +1,5 @@
 use anyhow::Result;
-use gpui::{Context, EntityInputHandler, Task, Window};
+use gpui::{Context, Entity, EntityInputHandler, Task, Window};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionResponse, InlineCompletionContext,
     InlineCompletionItem, InlineCompletionResponse, InlineCompletionTriggerKind,
@@ -7,9 +7,10 @@ use lsp_types::{
 };
 use ropey::Rope;
 use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
+use sum_tree::Bias;
 
 use crate::input::{
-    InputState,
+    InputState, RopeExt as _, TriggerCompletion,
     popovers::{CompletionMenu, ContextMenu},
 };
 
@@ -131,6 +132,22 @@ impl Default for InlineCompletion {
     }
 }
 
+fn completion_word_start(text: &Rope, cursor: usize) -> usize {
+    let cursor = text.clip_offset(cursor.min(text.len()), Bias::Left);
+    let mut start = cursor;
+    while start > 0 {
+        let previous = text.clip_offset(start.saturating_sub(1), Bias::Left);
+        let Some(character) = text.char_at(previous) else {
+            break;
+        };
+        if !(character.is_alphanumeric() || character == '_') {
+            break;
+        }
+        start = previous;
+    }
+    start
+}
+
 impl InputState {
     pub(crate) fn handle_completion_trigger(
         &mut self,
@@ -158,20 +175,7 @@ impl InputState {
             return;
         }
 
-        let menu = match self.context_menu_content.as_ref() {
-            Some(ContextMenu::Completion(menu)) => Some(menu),
-            _ => None,
-        };
-
-        // To create or get the existing completion menu.
-        let menu = match menu {
-            Some(menu) => menu.clone(),
-            None => {
-                let menu = CompletionMenu::new(cx.entity(), window, cx);
-                self.context_menu_content = Some(ContextMenu::Completion(menu.clone()));
-                menu
-            }
-        };
+        let menu = self.completion_menu(window, cx);
 
         let start_offset = menu.read(cx).trigger_start_offset.unwrap_or(start);
         if new_offset < start_offset {
@@ -185,19 +189,88 @@ impl InputState {
                 window,
                 cx,
             )
-            .map(|s| s.trim().to_string())
             .unwrap_or_default();
         _ = menu.update(cx, |menu, _| {
             menu.update_query(start_offset, query.clone());
         });
 
-        let completion_context = CompletionContext {
-            trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
-            trigger_character: Some(query),
+        self.request_completion_menu(
+            provider,
+            menu,
+            new_offset,
+            CompletionContext {
+                trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(query),
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn trigger_completion(
+        &mut self,
+        _: &TriggerCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.disabled || self.completion_inserting {
+            return;
+        }
+        let Some(provider) = self.lsp.completion_provider.clone() else {
+            return;
+        };
+        self.clear_inline_completion(cx);
+        let cursor = self.cursor();
+        let start_offset = completion_word_start(&self.text, cursor);
+        let query = self.text.slice(start_offset..cursor).to_string();
+        let menu = self.completion_menu(window, cx);
+        _ = menu.update(cx, |menu, _| {
+            menu.begin_query(start_offset, query);
+        });
+        self.request_completion_menu(
+            provider,
+            menu,
+            cursor,
+            CompletionContext {
+                trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn completion_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<CompletionMenu> {
+        let menu = match self.context_menu_content.as_ref() {
+            Some(ContextMenu::Completion(menu)) => Some(menu),
+            _ => None,
         };
 
+        match menu {
+            Some(menu) => menu.clone(),
+            None => {
+                let menu = CompletionMenu::new(cx.entity(), window, cx);
+                self.context_menu_content = Some(ContextMenu::Completion(menu.clone()));
+                menu
+            }
+        }
+    }
+
+    fn request_completion_menu(
+        &mut self,
+        provider: Rc<dyn CompletionProvider>,
+        menu: Entity<CompletionMenu>,
+        offset: usize,
+        completion_context: CompletionContext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let provider_responses =
-            provider.completions(&self.text, new_offset, completion_context, window, cx);
+            provider.completions(&self.text, offset, completion_context, window, cx);
         self._context_menu_task = cx.spawn_in(window, async move |editor, cx| {
             let mut completions: Vec<CompletionItem> = vec![];
             if let Some(provider_responses) = provider_responses.await.ok() {
@@ -218,12 +291,12 @@ impl InputState {
 
             editor
                 .update_in(cx, |editor, window, cx| {
-                    if !editor.focus_handle.is_focused(window) {
+                    if !editor.focus_handle.is_focused(window) || editor.cursor() != offset {
                         return;
                     }
 
                     _ = menu.update(cx, |menu, cx| {
-                        menu.show(new_offset, completions, window, cx);
+                        menu.show(offset, completions, window, cx);
                     });
 
                     cx.notify();
@@ -334,5 +407,22 @@ impl InputState {
         let completion_text = completion_item.insert_text;
         self.replace_text_in_range_silent(Some(range_utf16), &completion_text, window, cx);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_completion_replaces_only_the_identifier_before_the_cursor() {
+        let text = Rope::from("value.Δelta_name");
+        assert_eq!(completion_word_start(&text, text.len()), "value.".len());
+
+        let punctuation = Rope::from("Type::");
+        assert_eq!(
+            completion_word_start(&punctuation, punctuation.len()),
+            punctuation.len()
+        );
     }
 }
