@@ -10,6 +10,7 @@ mod completions;
 mod definitions;
 mod document_colors;
 mod document_highlights;
+mod folding_ranges;
 mod hover;
 mod inlay_hints;
 mod refresh;
@@ -21,6 +22,7 @@ pub use completions::*;
 pub use definitions::*;
 pub use document_colors::*;
 pub use document_highlights::*;
+pub use folding_ranges::*;
 pub use hover::*;
 pub use inlay_hints::*;
 pub use selection_ranges::*;
@@ -42,6 +44,8 @@ pub struct Lsp {
     pub document_color_provider: Option<Rc<dyn DocumentColorProvider>>,
     /// The document highlight provider.
     pub document_highlight_provider: Option<Rc<dyn DocumentHighlightProvider>>,
+    /// The document folding-range provider.
+    pub folding_range_provider: Option<Rc<dyn FoldingRangeProvider>>,
     /// The viewport inlay-hint provider.
     pub inlay_hint_provider: Option<Rc<dyn InlayHintProvider>>,
     /// The smart expand-selection provider.
@@ -51,6 +55,7 @@ pub struct Lsp {
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<lsp_types::DocumentHighlight>,
+    pub(super) folding_ranges: Vec<crate::input::display_map::FoldRange>,
     inlay_hints: Vec<lsp_types::InlayHint>,
     inlay_hint_range: Option<lsp_types::Range>,
     selection_range_history: Vec<Selection>,
@@ -62,6 +67,7 @@ pub struct Lsp {
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
+    _folding_range_task: Task<()>,
     _inlay_hint_task: Task<()>,
     _selection_range_task: Task<()>,
     _semantic_tokens_task: Task<()>,
@@ -76,11 +82,13 @@ impl Default for Lsp {
             definition_provider: None,
             document_color_provider: None,
             document_highlight_provider: None,
+            folding_range_provider: None,
             inlay_hint_provider: None,
             selection_range_provider: None,
             semantic_tokens_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
+            folding_ranges: Vec::new(),
             inlay_hints: vec![],
             inlay_hint_range: None,
             selection_range_history: Vec::new(),
@@ -89,6 +97,7 @@ impl Default for Lsp {
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
+            _folding_range_task: Task::ready(()),
             _inlay_hint_task: Task::ready(()),
             _selection_range_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
@@ -108,6 +117,8 @@ impl Lsp {
         self.inlay_hints.clear();
         self.selection_range_history.clear();
         self.selection_range_last = None;
+        self.folding_ranges.clear();
+        self.update_folding_ranges(text, window, cx);
         self.update_document_colors(text, window, cx);
         self.update_semantic_tokens(text, window, cx);
     }
@@ -116,6 +127,7 @@ impl Lsp {
     pub(crate) fn reset(&mut self) {
         self.document_colors.clear();
         self.document_highlights.clear();
+        self.folding_ranges.clear();
         self.inlay_hints.clear();
         self.inlay_hint_range = None;
         self.selection_range_history.clear();
@@ -124,6 +136,7 @@ impl Lsp {
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
+        self._folding_range_task = Task::ready(());
         self._inlay_hint_task = Task::ready(());
         self._selection_range_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());

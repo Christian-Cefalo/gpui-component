@@ -2616,26 +2616,43 @@ impl InputState {
 
     /// Update fold candidates from tree-sitter syntax tree (full extraction).
     /// Used only on initial load or language changes.
-    fn update_fold_candidates(&mut self) {
+    pub(super) fn update_fold_candidates(&mut self) {
         if !self.mode.is_folding() {
             return;
         }
 
-        let Some(highlighter_rc) = self.mode.highlighter() else {
-            return;
-        };
+        let fold_ranges = self
+            .mode
+            .highlighter()
+            .and_then(|highlighter| {
+                let highlighter = highlighter.borrow();
+                let tree = highlighter.as_ref()?.tree()?;
+                Some(crate::input::display_map::extract_fold_ranges(tree))
+            })
+            .unwrap_or_default();
+        self.set_syntax_fold_candidates(fold_ranges);
+    }
 
-        let highlighter = highlighter_rc.borrow();
-        let Some(highlighter) = highlighter.as_ref() else {
-            return;
-        };
-
-        let Some(tree) = highlighter.tree() else {
-            return;
-        };
-
-        let fold_ranges = crate::input::display_map::extract_fold_ranges(tree);
-        self.display_map.set_fold_candidates(fold_ranges);
+    fn set_syntax_fold_candidates(
+        &mut self,
+        fold_ranges: Vec<crate::input::display_map::FoldRange>,
+    ) {
+        let mut by_start = std::collections::BTreeMap::new();
+        for range in fold_ranges
+            .into_iter()
+            .chain(self.lsp.folding_ranges.iter().copied())
+        {
+            by_start
+                .entry(range.start_line)
+                .and_modify(|end: &mut usize| *end = (*end).max(range.end_line))
+                .or_insert(range.end_line);
+        }
+        self.display_map.set_fold_candidates(
+            by_start
+                .into_iter()
+                .map(|(start, end)| crate::input::display_map::FoldRange::new(start, end))
+                .collect(),
+        );
     }
 
     /// Incrementally update fold candidates after a text edit.
@@ -2645,26 +2662,30 @@ impl InputState {
             return;
         }
 
-        let Some(highlighter_rc) = self.mode.highlighter() else {
+        let Some(highlighter_rc) = self.mode.highlighter().cloned() else {
             return;
         };
 
-        let highlighter = highlighter_rc.borrow();
-        let Some(highlighter) = highlighter.as_ref() else {
-            return;
-        };
+        {
+            let highlighter = highlighter_rc.borrow();
+            let Some(highlighter) = highlighter.as_ref() else {
+                return;
+            };
+            let Some(tree) = highlighter.tree() else {
+                return;
+            };
 
-        let Some(tree) = highlighter.tree() else {
-            return;
-        };
-
-        // The new byte range in the updated text after the edit
-        let new_end = edit_range.start + new_text.len();
-        self.display_map.update_fold_candidates_for_edit(
-            tree,
-            edit_range.start..new_end,
-            &self.text,
-        );
+            // The new byte range in the updated text after the edit
+            let new_end = edit_range.start + new_text.len();
+            self.display_map.update_fold_candidates_for_edit(
+                tree,
+                edit_range.start..new_end,
+                &self.text,
+            );
+        }
+        if !self.lsp.folding_ranges.is_empty() {
+            self.update_fold_candidates();
+        }
     }
 
     /// Spawn a background parse after the synchronous parse timed out.
@@ -2752,7 +2773,7 @@ impl InputState {
                 // apply the fold candidates extracted in the background.
                 _ = entity.update(cx, |state, cx| {
                     if is_folding {
-                        state.display_map.set_fold_candidates(fold_ranges);
+                        state.set_syntax_fold_candidates(fold_ranges);
                     }
                     cx.notify();
                 });
