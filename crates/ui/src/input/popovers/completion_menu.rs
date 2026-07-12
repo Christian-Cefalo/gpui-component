@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{ops::Range, rc::Rc};
 
 use gpui::{
     Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
@@ -12,6 +12,126 @@ use ropey::Rope;
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
 const POPOVER_GAP: Pixels = px(4.);
+const MAX_COMPLETION_ITEMS: usize = 5_000;
+
+fn completion_query_fragment(query: &str) -> &str {
+    let start = query
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !(character.is_alphanumeric() || *character == '_'))
+        .map(|(index, character)| index + character.len_utf8())
+        .unwrap_or(0);
+    &query[start..]
+}
+
+fn completion_characters_equal(left: char, right: char) -> bool {
+    left == right || (left.is_ascii() && right.is_ascii() && left.eq_ignore_ascii_case(&right))
+}
+
+fn completion_match(query: &str, candidate: &str) -> Option<(i64, Vec<Range<usize>>)> {
+    if query.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let candidate_characters = candidate.char_indices().collect::<Vec<_>>();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    let mut score = 0i64;
+    let mut search_from = 0usize;
+    let mut previous_match = None;
+    for (query_index, query_character) in query.chars().enumerate() {
+        let (candidate_index, &(byte_start, candidate_character)) = candidate_characters
+            .iter()
+            .enumerate()
+            .skip(search_from)
+            .find(|(_, (_, candidate_character))| {
+                completion_characters_equal(query_character, *candidate_character)
+            })?;
+        let byte_end = byte_start + candidate_character.len_utf8();
+        score += 100;
+        if query_character == candidate_character {
+            score += 5;
+        }
+        if candidate_index == 0 {
+            score += 60;
+        } else {
+            let previous_character = candidate_characters[candidate_index - 1].1;
+            if !previous_character.is_alphanumeric()
+                || (previous_character.is_lowercase() && candidate_character.is_uppercase())
+            {
+                score += 35;
+            }
+        }
+        if previous_match == Some(candidate_index.saturating_sub(1)) {
+            score += 45;
+        } else if let Some(previous_match) = previous_match {
+            score -= candidate_index.saturating_sub(previous_match + 1) as i64;
+        } else if query_index == 0 {
+            score -= candidate_index as i64;
+        }
+        if let Some(last_range) = ranges.last_mut() {
+            if last_range.end == byte_start {
+                last_range.end = byte_end;
+            } else {
+                ranges.push(byte_start..byte_end);
+            }
+        } else {
+            ranges.push(byte_start..byte_end);
+        }
+        previous_match = Some(candidate_index);
+        search_from = candidate_index + 1;
+    }
+    score -= candidate_characters
+        .len()
+        .saturating_sub(query.chars().count()) as i64;
+    if candidate.len() == query.len()
+        && candidate
+            .chars()
+            .zip(query.chars())
+            .all(|(left, right)| completion_characters_equal(left, right))
+    {
+        score += 300;
+    }
+    Some((score, ranges))
+}
+
+fn rank_completion_items(
+    items: Vec<CompletionItem>,
+    raw_query: &str,
+) -> (Vec<CompletionItem>, usize) {
+    let query = completion_query_fragment(raw_query);
+    let mut ranked = items
+        .into_iter()
+        .take(MAX_COMPLETION_ITEMS)
+        .enumerate()
+        .filter_map(|(original_index, item)| {
+            let candidate = item.filter_text.as_deref().unwrap_or(&item.label);
+            completion_match(query, candidate).map(|(score, _)| {
+                let sort_key = item
+                    .sort_text
+                    .as_deref()
+                    .unwrap_or(&item.label)
+                    .to_lowercase();
+                let label_key = item.label.to_lowercase();
+                (item, score, sort_key, label_key, original_index)
+            })
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.2.cmp(&right.2))
+            .then_with(|| left.3.cmp(&right.3))
+            .then_with(|| left.4.cmp(&right.4))
+    });
+    let selected_index = ranked
+        .iter()
+        .position(|(item, _, _, _, _)| item.preselect.unwrap_or(false))
+        .unwrap_or(0);
+    (
+        ranked.into_iter().map(|(item, _, _, _, _)| item).collect(),
+        selected_index,
+    )
+}
 
 use crate::{
     ActiveTheme, IndexPath, Selectable, actions, h_flex,
@@ -130,20 +250,23 @@ impl RenderOnce for CompletionMenuItem {
         let item = self.item;
 
         let deprecated = item.deprecated.unwrap_or(false);
-        let matched_len = item
-            .filter_text
-            .as_ref()
-            .map(|s| s.len())
-            .unwrap_or(self.highlight_prefix.len())
-            .min(item.label.len());
-
-        let highlights = vec![(
-            0..matched_len,
-            HighlightStyle {
-                color: Some(cx.theme().blue),
-                ..Default::default()
-            },
-        )];
+        let highlight_query = completion_query_fragment(&self.highlight_prefix);
+        let highlights = completion_match(highlight_query, &item.label)
+            .map(|(_, ranges)| {
+                ranges
+                    .into_iter()
+                    .map(|range| {
+                        (
+                            range,
+                            HighlightStyle {
+                                color: Some(cx.theme().blue),
+                                ..Default::default()
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         h_flex()
             .id(self.ix)
@@ -515,7 +638,11 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let items = items.into();
+        let (items, selected_index) = rank_completion_items(items.into(), &self.query);
+        if items.is_empty() {
+            self.hide(cx);
+            return;
+        }
         self.offset = offset;
         self.open = true;
         self.list.update(cx, |this, cx| {
@@ -530,7 +657,7 @@ impl CompletionMenu {
 
             this.delegate_mut().query = self.query.clone();
             this.delegate_mut().set_items(items);
-            this.set_selected_index(Some(IndexPath::new(0)), window, cx);
+            this.set_selected_index(Some(IndexPath::new(selected_index)), window, cx);
             this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });
 
@@ -603,6 +730,73 @@ mod tests {
         let existing = Rope::from_str("format(value)");
         assert!(!should_insert_commit_character(&existing, 6, "format", "("));
         assert!(!should_insert_commit_character(&text, 6, "format", "::"));
+    }
+
+    #[test]
+    fn completion_ranking_filters_fuzzily_and_honors_filter_and_sort_text() {
+        let (items, selected) = rank_completion_items(
+            vec![
+                CompletionItem {
+                    label: "display_name".into(),
+                    filter_text: Some("dr".into()),
+                    sort_text: Some("b".into()),
+                    ..CompletionItem::default()
+                },
+                CompletionItem {
+                    label: "DebugRepresentation".into(),
+                    filter_text: Some("dr".into()),
+                    sort_text: Some("a".into()),
+                    preselect: Some(true),
+                    ..CompletionItem::default()
+                },
+                CompletionItem {
+                    label: "unrelated".into(),
+                    ..CompletionItem::default()
+                },
+            ],
+            ".dr",
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            ["DebugRepresentation", "display_name"]
+        );
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn completion_ranking_uses_sort_text_for_equal_empty_query_scores() {
+        let (items, selected) = rank_completion_items(
+            vec![
+                CompletionItem {
+                    label: "zebra".into(),
+                    sort_text: Some("002".into()),
+                    ..CompletionItem::default()
+                },
+                CompletionItem {
+                    label: "alpha".into(),
+                    sort_text: Some("001".into()),
+                    preselect: Some(true),
+                    ..CompletionItem::default()
+                },
+            ],
+            "::",
+        );
+        assert_eq!(items[0].label, "alpha");
+        assert_eq!(items[1].label, "zebra");
+        assert_eq!(selected, 0);
+    }
+
+    #[test]
+    fn completion_match_returns_utf8_safe_highlight_ranges() {
+        let (_, ranges) = completion_match("éx", "éclair_x").unwrap();
+        assert_eq!(ranges, vec![0..2, 8..9]);
+        for range in ranges {
+            assert!("éclair_x".is_char_boundary(range.start));
+            assert!("éclair_x".is_char_boundary(range.end));
+        }
     }
 }
 
