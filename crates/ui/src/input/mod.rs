@@ -19,6 +19,8 @@ pub(crate) mod popovers;
 mod rope_ext;
 mod search;
 mod selection;
+mod snippet;
+mod snippet_session;
 mod state;
 
 pub(crate) use clear_button::*;

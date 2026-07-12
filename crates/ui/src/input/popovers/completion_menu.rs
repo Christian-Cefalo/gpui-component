@@ -6,7 +6,7 @@ use gpui::{
     Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, deferred, div,
     prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit};
+use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat};
 use ropey::Rope;
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
@@ -18,6 +18,7 @@ use crate::{
     input::{
         self, InputState, RopeExt,
         popovers::{editor_popover, render_markdown},
+        snippet::parse_snippet,
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
@@ -300,6 +301,12 @@ impl CompletionMenu {
                 editor.completion_inserting = true;
 
                 let (range, new_text) = primary_completion_edit(&editor.text, trigger_range, &item);
+                let parsed_snippet = (item.insert_text_format == Some(InsertTextFormat::SNIPPET))
+                    .then(|| parse_snippet(&new_text));
+                let new_text = parsed_snippet
+                    .as_ref()
+                    .map(|snippet| snippet.text.clone())
+                    .unwrap_or(new_text);
 
                 let mut replacements = item
                     .additional_text_edits
@@ -332,8 +339,8 @@ impl CompletionMenu {
                             text.len() as isize - (edit_range.end - edit_range.start) as isize
                         })
                         .sum::<isize>();
-                    let cursor =
-                        (range.start + new_text.len()).saturating_add_signed(shift_before_primary);
+                    let snippet_start = range.start.saturating_add_signed(shift_before_primary);
+                    let cursor = snippet_start + new_text.len();
                     for (edit_range, text, _) in replacements.into_iter().rev() {
                         editor.replace_text_in_range_silent(
                             Some(editor.range_to_utf16(&edit_range)),
@@ -362,6 +369,9 @@ impl CompletionMenu {
                             );
                         }
                     }
+                    if let Some(parsed_snippet) = parsed_snippet.as_ref() {
+                        editor.start_snippet_session(parsed_snippet, snippet_start, cx);
+                    }
                 } else {
                     editor.replace_text_in_range_silent(
                         Some(editor.range_to_utf16(&range)),
@@ -369,6 +379,9 @@ impl CompletionMenu {
                         window,
                         cx,
                     );
+                    if let Some(parsed_snippet) = parsed_snippet.as_ref() {
+                        editor.start_snippet_session(parsed_snippet, range.start, cx);
+                    }
                 }
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus

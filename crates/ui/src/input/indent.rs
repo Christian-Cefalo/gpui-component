@@ -225,6 +225,9 @@ impl InputState {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
+        if self.move_to_next_snippet_tabstop(window, cx) {
+            return;
+        }
         // First, try to accept inline completion if present
         if self.accept_inline_completion(window, cx) {
             return;
@@ -242,6 +245,9 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.move_to_previous_snippet_tabstop(window, cx) {
+            return;
+        }
         self.outdent(false, window, cx);
     }
 

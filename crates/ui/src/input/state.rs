@@ -44,6 +44,7 @@ use crate::input::{
     element::RIGHT_MARGIN,
     popovers::{ContextMenu, DiagnosticPopover, HoverPopover},
     search::SearchPanel,
+    snippet::SnippetSession,
 };
 use crate::native_menu::NativeMenu;
 use crate::scroll::AutoScroll;
@@ -438,6 +439,11 @@ pub struct InputState {
 
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
+    /// Active LSP snippet tab stops, while their byte ranges remain valid.
+    pub(super) snippet_session: Option<SnippetSession>,
+    /// Mirror updates are editor-owned and must not be treated as user edits
+    /// to the active snippet placeholder.
+    pub(super) snippet_tracking_suspended: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
@@ -552,6 +558,8 @@ impl InputState {
             context_menu_builder: None,
             enable_context_menu: true,
             completion_inserting: false,
+            snippet_session: None,
+            snippet_tracking_suspended: false,
             hover_popover: None,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
@@ -2905,6 +2913,18 @@ impl EntityInputHandler for InputState {
         }
 
         if mask_changed {
+            self.snippet_session = None;
+        } else if !self.snippet_tracking_suspended {
+            let ranges_still_valid = self
+                .snippet_session
+                .as_mut()
+                .is_none_or(|session| session.track_user_edit(range.clone(), new_text.len()));
+            if !ranges_still_valid {
+                self.snippet_session = None;
+            }
+        }
+
+        if mask_changed {
             // A segment-based history entry no longer matches the masked
             // document, record a whole-document change instead, so that
             // undo/redo can restore the text exactly.
@@ -2936,6 +2956,12 @@ impl EntityInputHandler for InputState {
         self.update_preferred_column();
         self.update_search(cx);
         self.mode.update_auto_grow(&self.display_map);
+        if !self.snippet_tracking_suspended && self.snippet_session.is_some() {
+            let selection_after_user_edit = self.selected_range;
+            self.synchronize_active_snippet_mirrors(window, cx);
+            self.selected_range = selection_after_user_edit;
+            self.update_preferred_column();
+        }
         if !self.silent_replace_text {
             self.handle_completion_trigger(&range, &new_text, window, cx);
         }
@@ -2959,6 +2985,9 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        // IME composition owns a moving marked range. End a snippet session
+        // rather than retaining stale byte offsets while composition changes.
+        self.snippet_session = None;
         self.lsp.reset();
 
         // See the same NOTE in `replace_text_in_range`.
@@ -3181,6 +3210,38 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    #[gpui::test]
+    fn lsp_snippet_session_updates_mirrors_and_moves_to_final_tabstop(cx: &mut TestAppContext) {
+        use crate::input::{IndentInline, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1:name} = $1;$0");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(snippet.text.clone(), window, cx);
+                state.start_snippet_session(&snippet, 0, cx);
+                assert_eq!(state.selected_range, Selection::new(0, 4));
+
+                let selected_utf16 = state.range_to_utf16(&(0..4));
+                state.replace_text_in_range(Some(selected_utf16), "item", window, cx);
+                assert_eq!(state.value(), "item = item;");
+                assert_eq!(state.selected_range, Selection::new(4, 4));
+
+                state.indent_inline(&IndentInline, window, cx);
+                assert_eq!(state.selected_range, Selection::new(12, 12));
+                assert!(state.snippet_session.is_none());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "name = name;");
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "item = item;");
+            });
+        });
     }
 
     #[gpui::test]
