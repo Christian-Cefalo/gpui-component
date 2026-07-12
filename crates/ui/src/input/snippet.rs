@@ -1,5 +1,7 @@
 use std::{collections::BTreeMap, ops::Range};
 
+use super::TabSize;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SnippetTabstop {
     pub(crate) index: u32,
@@ -10,6 +12,172 @@ pub(crate) struct SnippetTabstop {
 pub(crate) struct ParsedSnippet {
     pub(crate) text: String,
     pub(crate) tabstops: Vec<SnippetTabstop>,
+}
+
+impl ParsedSnippet {
+    pub(crate) fn adjust_indentation(
+        &mut self,
+        base_indentation: &str,
+        tab_size: TabSize,
+        line_ending: &str,
+    ) {
+        let (text, offset_map) =
+            rewrite_indentation(&self.text, base_indentation, tab_size, line_ending);
+        for tabstop in &mut self.tabstops {
+            for range in &mut tabstop.ranges {
+                range.start = offset_map[range.start.min(offset_map.len() - 1)];
+                range.end = offset_map[range.end.min(offset_map.len() - 1)];
+            }
+        }
+        self.text = text;
+    }
+}
+
+pub(crate) fn adjust_text_indentation(
+    text: &str,
+    base_indentation: &str,
+    tab_size: TabSize,
+    line_ending: &str,
+) -> String {
+    rewrite_indentation(text, base_indentation, tab_size, line_ending).0
+}
+
+fn rewrite_indentation(
+    text: &str,
+    base_indentation: &str,
+    tab_size: TabSize,
+    line_ending: &str,
+) -> (String, Vec<usize>) {
+    let line_ending = if line_ending.is_empty() {
+        "\n"
+    } else {
+        line_ending
+    };
+    let mut rewritten = String::with_capacity(text.len() + base_indentation.len());
+    let mut offset_map = vec![0; text.len() + 1];
+    if text.is_empty() {
+        return (rewritten, offset_map);
+    }
+
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+    let mut line_index = 0;
+    let mut ended_with_line_break = false;
+    while offset < bytes.len() {
+        let mut line_end = offset;
+        while line_end < bytes.len() && !matches!(bytes[line_end], b'\r' | b'\n') {
+            line_end += 1;
+        }
+        let mut line_break_end = line_end;
+        if line_break_end < bytes.len() {
+            line_break_end += 1;
+            if bytes[line_end] == b'\r'
+                && line_break_end < bytes.len()
+                && bytes[line_break_end] == b'\n'
+            {
+                line_break_end += 1;
+            }
+        }
+
+        let mut whitespace_end = offset;
+        while whitespace_end < line_end && matches!(bytes[whitespace_end], b' ' | b'\t') {
+            whitespace_end += 1;
+        }
+        let indentation = if line_index == 0 {
+            normalize_indentation(&text[offset..whitespace_end], tab_size)
+        } else {
+            let mut combined = String::with_capacity(
+                base_indentation.len() + whitespace_end.saturating_sub(offset),
+            );
+            combined.push_str(base_indentation);
+            combined.push_str(&text[offset..whitespace_end]);
+            normalize_indentation(&combined, tab_size)
+        };
+        append_replacement(
+            &mut rewritten,
+            &mut offset_map,
+            offset..whitespace_end,
+            &indentation,
+        );
+        append_copy(
+            &mut rewritten,
+            &mut offset_map,
+            text,
+            whitespace_end..line_end,
+        );
+        if line_break_end > line_end {
+            append_replacement(
+                &mut rewritten,
+                &mut offset_map,
+                line_end..line_break_end,
+                line_ending,
+            );
+        }
+
+        ended_with_line_break = line_break_end > line_end && line_break_end == bytes.len();
+        offset = line_break_end;
+        line_index += 1;
+    }
+
+    if ended_with_line_break {
+        let indentation = normalize_indentation(base_indentation, tab_size);
+        append_replacement(
+            &mut rewritten,
+            &mut offset_map,
+            text.len()..text.len(),
+            &indentation,
+        );
+    }
+
+    (rewritten, offset_map)
+}
+
+fn normalize_indentation(indentation: &str, tab_size: TabSize) -> String {
+    let tab_width = tab_size.tab_size.max(1);
+    let columns = indentation
+        .bytes()
+        .fold(0usize, |columns, byte| match byte {
+            b' ' => columns + 1,
+            b'\t' => columns + tab_width - (columns % tab_width),
+            _ => columns,
+        });
+    if tab_size.hard_tabs {
+        format!(
+            "{}{}",
+            "\t".repeat(columns / tab_width),
+            " ".repeat(columns % tab_width)
+        )
+    } else {
+        " ".repeat(columns)
+    }
+}
+
+fn append_replacement(
+    rewritten: &mut String,
+    offset_map: &mut [usize],
+    old_range: Range<usize>,
+    replacement: &str,
+) {
+    let new_start = rewritten.len();
+    for old_offset in old_range.clone() {
+        offset_map[old_offset] = new_start + (old_offset - old_range.start).min(replacement.len());
+    }
+    rewritten.push_str(replacement);
+    offset_map[old_range.end] = rewritten.len();
+}
+
+fn append_copy(
+    rewritten: &mut String,
+    offset_map: &mut [usize],
+    source: &str,
+    old_range: Range<usize>,
+) {
+    let new_start = rewritten.len();
+    rewritten.push_str(&source[old_range.clone()]);
+    for old_offset in old_range.clone() {
+        offset_map[old_offset] = new_start + old_offset - old_range.start;
+    }
+    offset_map[old_range.end] = rewritten.len();
 }
 
 #[derive(Clone, Debug)]
@@ -454,5 +622,37 @@ mod tests {
         assert_eq!(session.active_range(), Some(7..10));
         assert_eq!(session.move_next(), Some(16..16));
         assert!(session.active_is_final());
+    }
+
+    #[test]
+    fn adjusted_multiline_snippet_preserves_placeholder_ranges() {
+        let mut parsed = parse_snippet("call(\r\n\t${1:value}\r\n)$0");
+        parsed.adjust_indentation(
+            "    ",
+            TabSize {
+                tab_size: 4,
+                hard_tabs: false,
+            },
+            "\n",
+        );
+
+        assert_eq!(parsed.text, "call(\n        value\n    )");
+        assert_eq!(parsed.tabstops[0].ranges, vec![14..19]);
+        assert_eq!(parsed.tabstops[1].ranges, vec![25..25]);
+    }
+
+    #[test]
+    fn adjusted_plain_text_uses_document_eol_and_hard_tabs() {
+        let adjusted = adjust_text_indentation(
+            "foo\n  bar\n",
+            "\t",
+            TabSize {
+                tab_size: 4,
+                hard_tabs: true,
+            },
+            "\r\n",
+        );
+
+        assert_eq!(adjusted, "foo\r\n\t  bar\r\n\t");
     }
 }

@@ -7,8 +7,8 @@ use gpui::{
     Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Task, Window, deferred,
     div, prelude::FluentBuilder, px, relative,
 };
-use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat};
-use ropey::Rope;
+use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode};
+use ropey::{LineType, Rope};
 
 type SharedCompletionResolution = Shared<futures::future::LocalBoxFuture<'static, CompletionItem>>;
 
@@ -172,7 +172,7 @@ use crate::{
     input::{
         self, CompletionInsertMode, InputState, RopeExt,
         popovers::{editor_popover, render_markdown},
-        snippet::parse_snippet,
+        snippet::{adjust_text_indentation, parse_snippet},
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
@@ -216,6 +216,38 @@ fn primary_completion_edit(
         }
     }
     (range, new_text)
+}
+
+fn completion_line_indentation(text: &Rope, cursor: usize) -> String {
+    let cursor = cursor.min(text.len());
+    let line = text.byte_to_line_idx(cursor, LineType::LF);
+    let line_start = text.line_to_byte_idx(line, LineType::LF);
+    text.try_slice(line_start..cursor)
+        .ok()
+        .map(|prefix| {
+            prefix
+                .chars()
+                .take_while(|character| matches!(character, ' ' | '\t'))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn completion_document_line_ending(text: &Rope) -> &'static str {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' if characters.peek() == Some(&'\n') => return "\r\n",
+            '\r' => return "\r",
+            '\n' => return "\n",
+            _ => {}
+        }
+    }
+    "\n"
+}
+
+fn completion_adjusts_indentation(mode: Option<InsertTextMode>) -> bool {
+    mode != Some(InsertTextMode::AS_IS)
 }
 
 fn completion_trigger_range(
@@ -658,12 +690,25 @@ impl CompletionMenu {
                     &item,
                     editor.lsp.completion_insert_mode,
                 );
-                let parsed_snippet = (item.insert_text_format == Some(InsertTextFormat::SNIPPET))
-                    .then(|| parse_snippet(&new_text));
-                let new_text = parsed_snippet
-                    .as_ref()
-                    .map(|snippet| snippet.text.clone())
-                    .unwrap_or(new_text);
+                let adjust_indentation = completion_adjusts_indentation(item.insert_text_mode);
+                let base_indentation = completion_line_indentation(&editor.text, expected_cursor);
+                let line_ending = completion_document_line_ending(&editor.text);
+                let tab_size = editor.mode.tab_size();
+                let mut parsed_snippet = (item.insert_text_format
+                    == Some(InsertTextFormat::SNIPPET))
+                .then(|| parse_snippet(&new_text));
+                if adjust_indentation {
+                    if let Some(snippet) = parsed_snippet.as_mut() {
+                        snippet.adjust_indentation(&base_indentation, tab_size, line_ending);
+                    }
+                }
+                let new_text = match parsed_snippet.as_ref() {
+                    Some(snippet) => snippet.text.clone(),
+                    None if adjust_indentation => {
+                        adjust_text_indentation(&new_text, &base_indentation, tab_size, line_ending)
+                    }
+                    None => new_text,
+                };
 
                 let mut replacements = item
                     .additional_text_edits
@@ -1227,6 +1272,59 @@ mod tests {
     }
 
     #[gpui::test]
+    fn multiline_snippet_uses_adjusted_indentation_by_default(cx: &mut TestAppContext) {
+        let completion = CompletionItem {
+            label: "if".into(),
+            text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 4),
+                    lsp_types::Position::new(0, 6),
+                ),
+                new_text: "if ${1:condition} {\n\t$0\n}".into(),
+            })),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        };
+        let provider = Rc::new(TestCompletionProvider {
+            calls: Rc::new(Cell::new(0)),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                completion.clone(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("    if", window, cx);
+                input.set_tab_size(
+                    crate::input::TabSize {
+                        tab_size: 4,
+                        hard_tabs: false,
+                    },
+                    window,
+                    cx,
+                );
+                input.set_cursor_position(lsp_types::Position::new(0, 6), window, cx);
+            });
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(4, "if");
+                menu.show(6, vec![completion], false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |input, _| {
+            assert_eq!(input.value(), "    if condition {\n        \n    }")
+        });
+    }
+
+    #[gpui::test]
     fn changing_completion_focus_rejects_the_stale_resolve_response(cx: &mut TestAppContext) {
         let calls = Rc::new(Cell::new(0));
         let (first_sender, first_receiver) = async_channel::bounded(1);
@@ -1314,6 +1412,23 @@ mod tests {
             primary_completion_edit(&text, 6..9, &item, CompletionInsertMode::Insert),
             (6..9, "format!".to_string())
         );
+    }
+
+    #[test]
+    fn completion_indentation_mode_and_document_context_match_lsp_defaults() {
+        assert!(completion_adjusts_indentation(None));
+        assert!(completion_adjusts_indentation(Some(
+            InsertTextMode::ADJUST_INDENTATION
+        )));
+        assert!(!completion_adjusts_indentation(Some(InsertTextMode::AS_IS)));
+
+        let lf = Rope::from_str("    value\nnext");
+        assert_eq!(completion_line_indentation(&lf, 9), "    ");
+        assert_eq!(completion_document_line_ending(&lf), "\n");
+
+        let crlf = Rope::from_str("\tvalue\r\nnext");
+        assert_eq!(completion_line_indentation(&crlf, 6), "\t");
+        assert_eq!(completion_document_line_ending(&crlf), "\r\n");
     }
 
     #[test]
