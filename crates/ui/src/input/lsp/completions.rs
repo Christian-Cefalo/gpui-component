@@ -6,7 +6,7 @@ use lsp_types::{
     request::Completion,
 };
 use ropey::Rope;
-use std::{cell::RefCell, ops::Range, rc::Rc, time::Duration};
+use std::{cell::RefCell, rc::Rc, time::Duration};
 use sum_tree::Bias;
 
 use crate::input::{
@@ -114,6 +114,25 @@ pub trait CompletionProvider {
         new_text: &str,
         cx: &mut Context<InputState>,
     ) -> bool;
+
+    /// Returns the protocol context for an automatic completion request.
+    ///
+    /// Providers with multi-character triggers should override this method
+    /// and inspect `text` at `offset`. The default preserves compatibility
+    /// with providers that only implement single-character triggering.
+    fn completion_context(
+        &self,
+        _text: &Rope,
+        offset: usize,
+        new_text: &str,
+        cx: &mut Context<InputState>,
+    ) -> Option<CompletionContext> {
+        self.is_completion_trigger(offset, new_text, cx)
+            .then(|| CompletionContext {
+                trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some(new_text.to_string()),
+            })
+    }
 }
 
 pub(crate) struct InlineCompletion {
@@ -151,7 +170,6 @@ fn completion_word_start(text: &Rope, cursor: usize) -> usize {
 impl InputState {
     pub(crate) fn handle_completion_trigger(
         &mut self,
-        range: &Range<usize>,
         new_text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -168,17 +186,34 @@ impl InputState {
         // It will check if menu is open before showing the suggestion.
         self.schedule_inline_completion(window, cx);
 
-        let start = range.end;
         let new_offset = self.cursor();
-
-        if !provider.is_completion_trigger(start, new_text, cx) {
+        let existing_menu = match self.context_menu_content.as_ref() {
+            Some(ContextMenu::Completion(menu)) if menu.read(cx).is_open() => Some(menu.clone()),
+            _ => None,
+        };
+        let completion_context = provider
+            .completion_context(&self.text, new_offset, new_text, cx)
+            .or_else(|| {
+                (existing_menu.is_some() && new_text.is_empty()).then_some(CompletionContext {
+                    trigger_kind: lsp_types::CompletionTriggerKind::INVOKED,
+                    trigger_character: None,
+                })
+            });
+        let Some(completion_context) = completion_context else {
+            if let Some(menu) = existing_menu {
+                _ = menu.update(cx, |menu, cx| menu.hide(cx));
+            }
             return;
-        }
+        };
 
         let menu = self.completion_menu(window, cx);
-
-        let start_offset = menu.read(cx).trigger_start_offset.unwrap_or(start);
+        let replacement_start = completion_word_start(&self.text, new_offset);
+        let start_offset = menu
+            .read(cx)
+            .trigger_start_offset
+            .unwrap_or(replacement_start);
         if new_offset < start_offset {
+            _ = menu.update(cx, |menu, cx| menu.hide(cx));
             return;
         }
 
@@ -194,17 +229,7 @@ impl InputState {
             menu.update_query(start_offset, query.clone());
         });
 
-        self.request_completion_menu(
-            provider,
-            menu,
-            new_offset,
-            CompletionContext {
-                trigger_kind: lsp_types::CompletionTriggerKind::TRIGGER_CHARACTER,
-                trigger_character: Some(query),
-            },
-            window,
-            cx,
-        );
+        self.request_completion_menu(provider, menu, new_offset, completion_context, window, cx);
     }
 
     pub(crate) fn trigger_completion(

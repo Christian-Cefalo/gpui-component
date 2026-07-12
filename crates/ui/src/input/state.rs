@@ -2965,7 +2965,7 @@ impl EntityInputHandler for InputState {
             self.update_preferred_column();
         }
         if !self.silent_replace_text {
-            self.handle_completion_trigger(&range, &new_text, window, cx);
+            self.handle_completion_trigger(&new_text, window, cx);
         }
         if self.emit_events {
             cx.emit(InputEvent::Change);
