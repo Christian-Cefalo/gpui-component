@@ -1,18 +1,52 @@
 use std::{ops::Range, rc::Rc};
 
+use futures::{FutureExt as _, future::Shared};
 use gpui::{
     Action, AnyElement, App, AppContext, Context, DismissEvent, Empty, Entity, EventEmitter,
     Half as _, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels, Point,
-    Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Window, deferred, div,
-    prelude::FluentBuilder, px, relative,
+    Render, RenderOnce, SharedString, Styled, StyledText, Subscription, Task, Window, deferred,
+    div, prelude::FluentBuilder, px, relative,
 };
 use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat};
 use ropey::Rope;
+
+type SharedCompletionResolution = Shared<futures::future::LocalBoxFuture<'static, CompletionItem>>;
 
 const MAX_MENU_WIDTH: Pixels = px(320.);
 const MAX_MENU_HEIGHT: Pixels = px(240.);
 const POPOVER_GAP: Pixels = px(4.);
 const MAX_COMPLETION_ITEMS: usize = 5_000;
+
+#[derive(Default)]
+struct CompletionResolutionTracker {
+    generation: u64,
+    resolving_index: Option<usize>,
+}
+
+impl CompletionResolutionTracker {
+    fn start(&mut self, index: usize) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.resolving_index = Some(index);
+        self.generation
+    }
+
+    fn cancel(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.resolving_index = None;
+    }
+
+    fn is_current(&self, generation: u64, index: usize) -> bool {
+        self.generation == generation && self.resolving_index == Some(index)
+    }
+
+    fn finish(&mut self, generation: u64, index: usize) -> bool {
+        if !self.is_current(generation, index) {
+            return false;
+        }
+        self.resolving_index = None;
+        true
+    }
+}
 
 fn completion_query_fragment(query: &str) -> &str {
     let start = query
@@ -148,6 +182,7 @@ struct ContextMenuDelegate {
     query: SharedString,
     menu: Entity<CompletionMenu>,
     items: Vec<Rc<CompletionItem>>,
+    resolved: Vec<bool>,
     selected_ix: usize,
 }
 
@@ -178,6 +213,15 @@ fn primary_completion_edit(
     (range, new_text)
 }
 
+fn completion_trigger_range(
+    trigger_start_offset: Option<usize>,
+    response_offset: usize,
+    current_cursor: usize,
+) -> Option<Range<usize>> {
+    let start = trigger_start_offset.unwrap_or(response_offset);
+    (current_cursor >= start).then_some(start..current_cursor)
+}
+
 fn should_insert_commit_character(
     text: &Rope,
     cursor: usize,
@@ -195,12 +239,20 @@ fn should_insert_commit_character(
 
 impl ContextMenuDelegate {
     fn set_items(&mut self, items: Vec<CompletionItem>) {
+        self.resolved = vec![false; items.len()];
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
     }
 
     fn selected_item(&self) -> Option<&Rc<CompletionItem>> {
         self.items.get(self.selected_ix)
+    }
+
+    fn selected_item_is_resolved(&self) -> bool {
+        self.resolved
+            .get(self.selected_ix)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -316,20 +368,28 @@ impl ListDelegate for ContextMenuDelegate {
     fn set_selected_index(
         &mut self,
         ix: Option<crate::IndexPath>,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) {
         self.selected_ix = ix.map(|i| i.row).unwrap_or(0);
+        let menu = self.menu.clone();
+        let selected_ix = ix.map(|ix| ix.row);
+        window.defer(cx, move |window, cx| {
+            _ = menu.update(cx, |menu, cx| {
+                menu.resolve_selected_item(selected_ix, window, cx);
+            });
+        });
         cx.notify();
     }
 
     fn confirm(&mut self, _: bool, window: &mut Window, cx: &mut Context<ListState<Self>>) {
-        let Some(item) = self.selected_item() else {
+        let Some(item) = self.selected_item().cloned() else {
             return;
         };
+        let resolved = self.selected_item_is_resolved();
 
         self.menu.update(cx, |this, cx| {
-            this.select_item(&item, None, window, cx);
+            this.select_item(&item, resolved, None, window, cx);
         });
     }
 }
@@ -344,6 +404,9 @@ pub struct CompletionMenu {
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
     query: SharedString,
+    resolution: CompletionResolutionTracker,
+    pending_resolution: Option<SharedCompletionResolution>,
+    _resolve_task: Task<anyhow::Result<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -362,6 +425,7 @@ impl CompletionMenu {
                 query: SharedString::default(),
                 menu: view,
                 items: vec![],
+                resolved: vec![],
                 selected_ix: 0,
             };
 
@@ -387,40 +451,157 @@ impl CompletionMenu {
                 open: false,
                 trigger_start_offset: None,
                 query: SharedString::default(),
+                resolution: CompletionResolutionTracker::default(),
+                pending_resolution: None,
+                _resolve_task: Task::ready(Ok(())),
                 _subscriptions,
             }
         })
     }
 
+    fn cancel_completion_resolution(&mut self) {
+        self.resolution.cancel();
+        self._resolve_task = Task::ready(Ok(()));
+        self.pending_resolution = None;
+    }
+
+    fn resolve_selected_item(
+        &mut self,
+        requested_index: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.open
+            || self.list.read(cx).selected_index().map(|index| index.row) != requested_index
+        {
+            return;
+        }
+        let Some(index) = requested_index else {
+            self.cancel_completion_resolution();
+            return;
+        };
+        let (item, resolved) = {
+            let list = self.list.read(cx);
+            let delegate = list.delegate();
+            let Some(item) = delegate.items.get(index).cloned() else {
+                return;
+            };
+            let resolved = delegate.resolved.get(index).copied().unwrap_or(false);
+            (item, resolved)
+        };
+        if resolved {
+            self.cancel_completion_resolution();
+            return;
+        }
+        if self.resolution.resolving_index == Some(index) {
+            return;
+        }
+
+        self.cancel_completion_resolution();
+        let generation = self.resolution.start(index);
+        let editor = self.editor.clone();
+        let original = (*item).clone();
+        let resolution = editor.update(cx, |editor, cx| {
+            editor
+                .lsp
+                .completion_provider
+                .clone()
+                .map(|provider| provider.resolve_completion(original.clone(), window, cx))
+        });
+        let pending_resolution = async move {
+            match resolution {
+                Some(task) => task.await.unwrap_or(original),
+                None => original,
+            }
+        }
+        .boxed_local()
+        .shared();
+        self.pending_resolution = Some(pending_resolution.clone());
+        self._resolve_task = cx.spawn_in(window, async move |menu, cx| {
+            let resolved_item = pending_resolution.await;
+
+            menu.update_in(cx, |menu, _window, cx| {
+                if !menu.open
+                    || !menu.resolution.is_current(generation, index)
+                    || menu
+                        .list
+                        .read(cx)
+                        .selected_index()
+                        .map(|selected| selected.row)
+                        != Some(index)
+                {
+                    return;
+                }
+                menu.list.update(cx, |list, cx| {
+                    let delegate = list.delegate_mut();
+                    if let (Some(item), Some(resolved)) = (
+                        delegate.items.get_mut(index),
+                        delegate.resolved.get_mut(index),
+                    ) {
+                        *item = Rc::new(resolved_item);
+                        *resolved = true;
+                    }
+                    cx.notify();
+                });
+                menu.resolution.finish(generation, index);
+                menu.pending_resolution = None;
+                cx.notify();
+            })?;
+            Ok(())
+        });
+    }
+
     fn select_item(
         &mut self,
         item: &CompletionItem,
+        already_resolved: bool,
         commit_character: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let item = item.clone();
-        let trigger_range = self.trigger_start_offset.unwrap_or(self.offset)..self.offset;
-
         let editor = self.editor.clone();
+        let selected_index = self.list.read(cx).selected_index().map(|index| index.row);
+        let pending_resolution = (!already_resolved
+            && self.resolution.resolving_index == selected_index)
+            .then(|| self.pending_resolution.clone())
+            .flatten();
+        let (expected_text, expected_cursor) = {
+            let editor = editor.read(cx);
+            (editor.text.clone(), editor.cursor())
+        };
+        let Some(trigger_range) =
+            completion_trigger_range(self.trigger_start_offset, self.offset, expected_cursor)
+        else {
+            self.hide(cx);
+            return;
+        };
 
         cx.spawn_in(window, async move |_, cx| {
-            let resolved = editor
-                .update_in(cx, |editor, window, cx| {
+            let item = if already_resolved {
+                item
+            } else if let Some(pending_resolution) = pending_resolution {
+                pending_resolution.await
+            } else {
+                let resolved =
                     editor
-                        .lsp
-                        .completion_provider
-                        .clone()
-                        .map(|provider| provider.resolve_completion(item.clone(), window, cx))
-                })
-                .ok()
-                .flatten();
-            let item = match resolved {
-                Some(task) => task.await.unwrap_or(item),
-                None => item,
+                        .update_in(cx, |editor, window, cx| {
+                            editor.lsp.completion_provider.clone().map(|provider| {
+                                provider.resolve_completion(item.clone(), window, cx)
+                            })
+                        })
+                        .ok()
+                        .flatten();
+                match resolved {
+                    Some(task) => task.await.unwrap_or(item),
+                    None => item,
+                }
             };
             let accepted = item.clone();
-            editor.update_in(cx, |editor, window, cx| {
+            let inserted = editor.update_in(cx, |editor, window, cx| {
+                if editor.cursor() != expected_cursor || editor.text != expected_text {
+                    return false;
+                }
                 editor.completion_inserting = true;
 
                 let (range, new_text) = primary_completion_edit(&editor.text, trigger_range, &item);
@@ -509,7 +690,11 @@ impl CompletionMenu {
                 editor.completion_inserting = false;
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
+                true
             })?;
+            if !inserted {
+                return Ok::<(), anyhow::Error>(());
+            }
 
             let accepted_task = editor
                 .update_in(cx, |editor, window, cx| {
@@ -560,17 +745,21 @@ impl CompletionMenu {
     }
 
     fn on_action_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
+        let list = self.list.read(cx);
+        let Some(item) = list.delegate().selected_item().cloned() else {
             return;
         };
-        self.select_item(&item, None, window, cx);
+        let resolved = list.delegate().selected_item_is_resolved();
+        self.select_item(&item, resolved, None, window, cx);
     }
 
     fn on_action_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
+        let list = self.list.read(cx);
+        let Some(item) = list.delegate().selected_item().cloned() else {
             return;
         };
-        self.select_item(&item, None, window, cx);
+        let resolved = list.delegate().selected_item_is_resolved();
+        self.select_item(&item, resolved, None, window, cx);
     }
 
     pub(crate) fn accept_commit_character(
@@ -582,9 +771,11 @@ impl CompletionMenu {
         if !self.open || character.chars().count() != 1 {
             return false;
         }
-        let Some(item) = self.list.read(cx).delegate().selected_item().cloned() else {
+        let list = self.list.read(cx);
+        let Some(item) = list.delegate().selected_item().cloned() else {
             return false;
         };
+        let resolved = list.delegate().selected_item_is_resolved();
         if !item
             .commit_characters
             .as_ref()
@@ -592,7 +783,7 @@ impl CompletionMenu {
         {
             return false;
         }
-        self.select_item(&item, Some(character.to_string()), window, cx);
+        self.select_item(&item, resolved, Some(character.to_string()), window, cx);
         true
     }
 
@@ -618,6 +809,7 @@ impl CompletionMenu {
 
     /// Hide the completion menu and reset the trigger start offset.
     pub(crate) fn hide(&mut self, cx: &mut Context<Self>) {
+        self.cancel_completion_resolution();
         self.open = false;
         self.trigger_start_offset = None;
         cx.notify();
@@ -625,13 +817,18 @@ impl CompletionMenu {
 
     /// Sets the trigger start offset if it is not already set.
     pub(crate) fn update_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
+        let query = query.into();
+        if self.query != query {
+            self.cancel_completion_resolution();
+        }
         if self.trigger_start_offset.is_none() {
             self.trigger_start_offset = Some(start_offset);
         }
-        self.query = query.into();
+        self.query = query;
     }
 
     pub(crate) fn begin_query(&mut self, start_offset: usize, query: impl Into<SharedString>) {
+        self.cancel_completion_resolution();
         self.trigger_start_offset = Some(start_offset);
         self.query = query.into();
     }
@@ -643,6 +840,7 @@ impl CompletionMenu {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_completion_resolution();
         let (items, selected_index) = rank_completion_items(items.into(), &self.query);
         if items.is_empty() {
             self.hide(cx);
@@ -690,6 +888,295 @@ impl CompletionMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        cell::{Cell, RefCell},
+        collections::VecDeque,
+    };
+
+    use gpui::{TestAppContext, VisualTestContext};
+
+    use crate::{Root, input::CompletionProvider};
+
+    enum TestCompletionResolution {
+        Ready(CompletionItem),
+        Pending(async_channel::Receiver<CompletionItem>),
+    }
+
+    struct TestCompletionProvider {
+        calls: Rc<Cell<usize>>,
+        resolutions: RefCell<VecDeque<TestCompletionResolution>>,
+    }
+
+    impl CompletionProvider for TestCompletionProvider {
+        fn completions(
+            &self,
+            _text: &Rope,
+            _offset: usize,
+            _trigger: lsp_types::CompletionContext,
+            _window: &mut Window,
+            _cx: &mut Context<InputState>,
+        ) -> Task<anyhow::Result<lsp_types::CompletionResponse>> {
+            Task::ready(Ok(lsp_types::CompletionResponse::Array(Vec::new())))
+        }
+
+        fn resolve_completion(
+            &self,
+            _item: CompletionItem,
+            window: &mut Window,
+            cx: &mut Context<InputState>,
+        ) -> Task<anyhow::Result<CompletionItem>> {
+            self.calls.set(self.calls.get() + 1);
+            match self.resolutions.borrow_mut().pop_front() {
+                Some(TestCompletionResolution::Ready(item)) => Task::ready(Ok(item)),
+                Some(TestCompletionResolution::Pending(receiver)) => {
+                    window.spawn(cx, async move |_| Ok(receiver.recv().await?))
+                }
+                None => Task::ready(Err(anyhow::anyhow!(
+                    "completion item was resolved more than once"
+                ))),
+            }
+        }
+
+        fn is_completion_trigger(
+            &self,
+            _offset: usize,
+            _new_text: &str,
+            _cx: &mut Context<InputState>,
+        ) -> bool {
+            false
+        }
+    }
+
+    fn completion_test_view(
+        cx: &mut TestAppContext,
+        provider: Rc<dyn CompletionProvider>,
+    ) -> (
+        Entity<InputState>,
+        Entity<CompletionMenu>,
+        gpui::WindowHandle<Root>,
+    ) {
+        cx.update(crate::init);
+        let mut input = None;
+        let mut menu = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let input_entity = cx.new(|cx| {
+                    let mut state = InputState::new(window, cx).code_editor("rust");
+                    state.lsp.completion_provider = Some(provider);
+                    state.set_value("fo", window, cx);
+                    state.set_cursor_position(lsp_types::Position::new(0, 2), window, cx);
+                    state
+                });
+                let menu_entity = CompletionMenu::new(input_entity.clone(), window, cx);
+                input = Some(input_entity.clone());
+                menu = Some(menu_entity);
+                cx.new(|cx| Root::new(input_entity, window, cx))
+            })
+            .unwrap()
+        });
+        (input.unwrap(), menu.unwrap(), window)
+    }
+
+    fn resolved_completion(label: &str, detail: &str, documentation: &str) -> CompletionItem {
+        CompletionItem {
+            label: label.into(),
+            insert_text: Some(label.into()),
+            detail: Some(detail.into()),
+            documentation: Some(lsp_types::Documentation::String(documentation.into())),
+            ..CompletionItem::default()
+        }
+    }
+
+    fn resolved_format_completion() -> CompletionItem {
+        resolved_completion(
+            "format",
+            "fn format(value: &str)",
+            "Formats a value without allocating.",
+        )
+    }
+
+    #[test]
+    fn completion_resolution_tracker_invalidates_stale_selections() {
+        let mut tracker = CompletionResolutionTracker::default();
+        let first = tracker.start(2);
+        assert!(tracker.is_current(first, 2));
+
+        let second = tracker.start(4);
+        assert!(!tracker.is_current(first, 2));
+        assert!(tracker.is_current(second, 4));
+        assert!(!tracker.finish(first, 2));
+        assert!(tracker.finish(second, 4));
+        assert_eq!(tracker.resolving_index, None);
+
+        let third = tracker.start(1);
+        tracker.cancel();
+        assert!(!tracker.is_current(third, 1));
+    }
+
+    #[gpui::test]
+    fn focused_completion_resolves_once_and_refreshes_visible_details(cx: &mut TestAppContext) {
+        let calls = Rc::new(Cell::new(0));
+        let provider = Rc::new(TestCompletionProvider {
+            calls: calls.clone(),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                resolved_format_completion(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "fo");
+                menu.show(
+                    2,
+                    vec![CompletionItem {
+                        label: "format".into(),
+                        ..CompletionItem::default()
+                    }],
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            let list = menu.read(cx).list.clone();
+            let list = list.read(cx);
+            let item = list.delegate().selected_item().unwrap();
+            assert_eq!(item.detail.as_deref(), Some("fn format(value: &str)"));
+            assert_eq!(
+                item.documentation,
+                Some(lsp_types::Documentation::String(
+                    "Formats a value without allocating.".into()
+                ))
+            );
+            assert!(list.delegate().selected_item_is_resolved());
+            assert_eq!(calls.get(), 1);
+        });
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.get(), 1);
+        input.read_with(&cx, |input, _| assert_eq!(input.value(), "format"));
+    }
+
+    #[gpui::test]
+    fn accepting_a_resolving_completion_reuses_the_in_flight_request(cx: &mut TestAppContext) {
+        let calls = Rc::new(Cell::new(0));
+        let (sender, receiver) = async_channel::bounded(1);
+        let provider = Rc::new(TestCompletionProvider {
+            calls: calls.clone(),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Pending(
+                receiver,
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "fo");
+                menu.show(
+                    2,
+                    vec![CompletionItem {
+                        label: "format".into(),
+                        ..CompletionItem::default()
+                    }],
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.get(), 1);
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        sender.try_send(resolved_format_completion()).unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(calls.get(), 1);
+        input.read_with(&cx, |input, _| assert_eq!(input.value(), "format"));
+    }
+
+    #[gpui::test]
+    fn changing_completion_focus_rejects_the_stale_resolve_response(cx: &mut TestAppContext) {
+        let calls = Rc::new(Cell::new(0));
+        let (first_sender, first_receiver) = async_channel::bounded(1);
+        let (second_sender, second_receiver) = async_channel::bounded(1);
+        let provider = Rc::new(TestCompletionProvider {
+            calls: calls.clone(),
+            resolutions: RefCell::new(VecDeque::from([
+                TestCompletionResolution::Pending(first_receiver),
+                TestCompletionResolution::Pending(second_receiver),
+            ])),
+        });
+        let (_input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "");
+                menu.show(
+                    2,
+                    vec![
+                        CompletionItem {
+                            label: "alpha".into(),
+                            ..CompletionItem::default()
+                        },
+                        CompletionItem {
+                            label: "beta".into(),
+                            ..CompletionItem::default()
+                        },
+                    ],
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.get(), 1);
+
+        cx.update(|window, cx| {
+            let list = menu.read(cx).list.clone();
+            list.update(cx, |list, cx| {
+                list.set_selected_index(Some(IndexPath::new(1)), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.get(), 2);
+
+        _ = first_sender.try_send(resolved_completion(
+            "alpha",
+            "stale alpha detail",
+            "stale alpha documentation",
+        ));
+        second_sender
+            .try_send(resolved_completion(
+                "beta",
+                "current beta detail",
+                "current beta documentation",
+            ))
+            .unwrap();
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            let list = menu.read(cx).list.clone();
+            let list = list.read(cx);
+            assert_eq!(list.delegate().selected_ix, 1);
+            assert_eq!(list.delegate().items[0].detail, None);
+            assert_eq!(
+                list.delegate().items[1].detail.as_deref(),
+                Some("current beta detail")
+            );
+            assert!(list.delegate().resolved[1]);
+        });
+    }
 
     #[test]
     fn insert_text_replaces_the_typed_completion_prefix() {
@@ -704,6 +1191,13 @@ mod tests {
             primary_completion_edit(&text, 6..9, &item),
             (6..9, "format!".to_string())
         );
+    }
+
+    #[test]
+    fn completion_acceptance_uses_the_current_query_end() {
+        assert_eq!(completion_trigger_range(Some(6), 9, 12), Some(6..12));
+        assert_eq!(completion_trigger_range(Some(6), 9, 5), None);
+        assert_eq!(completion_trigger_range(None, 9, 12), Some(9..12));
     }
 
     #[test]

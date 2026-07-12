@@ -78,10 +78,14 @@ pub trait CompletionProvider {
         Task::ready(Ok(false))
     }
 
-    /// Resolves a completion immediately before it is accepted.
+    /// Resolves a completion when it becomes the focused suggestion.
     ///
-    /// Providers should return the original item when no resolution is
-    /// required. The default keeps existing completion behavior unchanged.
+    /// Successful results are cached by the completion menu and reused on
+    /// acceptance. A request can be dropped when focus moves or the menu is
+    /// dismissed, so providers should make cancellation safe. Acceptance
+    /// reuses an in-flight focused-item request; if no request exists, the menu
+    /// starts one final resolve before insertion. Providers should return the
+    /// original item when no resolution is required.
     fn resolve_completion(
         &self,
         item: CompletionItem,
