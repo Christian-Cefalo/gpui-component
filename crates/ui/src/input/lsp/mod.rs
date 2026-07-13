@@ -228,6 +228,11 @@ impl Lsp {
         self._code_action_task = Task::ready(());
         self._signature_help_task = Task::ready(());
     }
+
+    #[cfg(test)]
+    pub(super) fn replace_hover_task_for_test(&mut self, task: Task<Result<()>>) {
+        self._hover_task = task;
+    }
 }
 
 impl InputState {

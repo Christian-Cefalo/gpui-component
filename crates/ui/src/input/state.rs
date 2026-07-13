@@ -3201,6 +3201,11 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        // Hover content and modifier-hover navigation describe the previous
+        // document snapshot. Drop the provider task before applying any edit
+        // so a late response cannot recreate stale UI over changed text.
+        self.clear_hover_state(cx);
+
         if self.blink_cursor.read(cx).visible() {
             self.pause_blink_cursor(cx);
         }
@@ -3360,6 +3365,8 @@ impl EntityInputHandler for InputState {
         if self.disabled {
             return;
         }
+
+        self.clear_hover_state(cx);
 
         // IME composition owns a moving marked range. End a snippet session
         // rather than retaining stale byte offsets while composition changes.
@@ -3578,9 +3585,9 @@ mod tests {
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
     use lsp_types::{
-        CodeAction, CodeActionKind, CodeLens, Command, DocumentLink, ParameterInformation,
-        ParameterLabel, Position as LspPosition, Range as LspRange, SignatureHelp,
-        SignatureHelpContext, SignatureInformation,
+        CodeAction, CodeActionKind, CodeLens, Command, DocumentLink, Hover, HoverContents,
+        MarkedString, ParameterInformation, ParameterLabel, Position as LspPosition,
+        Range as LspRange, SignatureHelp, SignatureHelpContext, SignatureInformation,
     };
     use std::{cell::RefCell, time::Duration};
 
@@ -3819,6 +3826,40 @@ mod tests {
                 assert!(!state.has_document_link_at_cursor());
             });
         });
+    }
+
+    #[gpui::test]
+    fn text_changes_dismiss_visible_hover_and_cancel_its_provider_task(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let stale_task_completed = Rc::new(Cell::new(false));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha", window, cx);
+                let hover = Hover {
+                    contents: HoverContents::Scalar(MarkedString::String("stale hover".into())),
+                    range: None,
+                };
+                state.hover_popover = Some(HoverPopover::new(cx.entity(), 0..5, &hover, cx));
+                let stale_task_completed = stale_task_completed.clone();
+                state
+                    .lsp
+                    .replace_hover_task_for_test(cx.spawn_in(window, async move |_, cx| {
+                        cx.background_executor().timer(Duration::from_secs(1)).await;
+                        stale_task_completed.set(true);
+                        Ok(())
+                    }));
+
+                assert!(state.hover_popover.is_some());
+                state.replace_text_in_range(None, "z", window, cx);
+                assert!(state.hover_popover.is_none());
+            });
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        assert!(!stale_task_completed.get());
     }
 
     #[gpui::test]
