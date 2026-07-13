@@ -315,15 +315,6 @@ impl RenderOnce for Input {
                             InputState::on_action_trigger_parameter_hints,
                         ),
                     )
-                    .on_action(
-                        window.listener_for(
-                            &self.state,
-                            InputState::on_action_previous_parameter_hint,
-                        ),
-                    )
-                    .on_action(
-                        window.listener_for(&self.state, InputState::on_action_next_parameter_hint),
-                    )
                     .when(state.mode.is_multi_line(), |this| {
                         this.on_action(window.listener_for(&self.state, InputState::indent_inline))
                             .on_action(window.listener_for(&self.state, InputState::outdent_inline))

@@ -57,6 +57,16 @@ fn normalize_signature(mut signature: SignatureInformation) -> Option<SignatureI
     }
     if let Some(parameters) = signature.parameters.as_mut() {
         parameters.truncate(MAX_PARAMETERS);
+        signature.active_parameter = if parameters.is_empty() {
+            None
+        } else {
+            Some(
+                (signature.active_parameter.unwrap_or(0) as usize)
+                    .min(parameters.len().saturating_sub(1)) as u32,
+            )
+        };
+    } else {
+        signature.active_parameter = None;
     }
     Some(signature)
 }
@@ -261,24 +271,6 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         self.trigger_parameter_hints(cx);
-    }
-
-    pub(crate) fn on_action_previous_parameter_hint(
-        &mut self,
-        _: &crate::input::PreviousParameterHint,
-        _: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.previous_parameter_hint(cx);
-    }
-
-    pub(crate) fn on_action_next_parameter_hint(
-        &mut self,
-        _: &crate::input::NextParameterHint,
-        _: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.next_parameter_hint(cx);
     }
 }
 

@@ -123,8 +123,6 @@ actions!(
         GoToDefinition,
         OpenDocumentLink,
         TriggerParameterHints,
-        PreviousParameterHint,
-        NextParameterHint,
     ]
 );
 
@@ -201,8 +199,6 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-space", TriggerParameterHints, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-space", TriggerParameterHints, Some(CONTEXT)),
-        KeyBinding::new("alt-up", PreviousParameterHint, Some(CONTEXT)),
-        KeyBinding::new("alt-down", NextParameterHint, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
