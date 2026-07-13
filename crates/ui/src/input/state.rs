@@ -3610,6 +3610,7 @@ impl Render for InputState {
             self.update_fold_candidates();
             self.lsp.update(&self.text, window, cx);
             self._pending_update = false;
+            self.refresh_linked_editing_ranges(false, window, cx);
         }
 
         div()
@@ -3918,6 +3919,29 @@ mod tests {
             input.update(cx, |state, cx| state.redo(&Redo, window, cx));
         });
         input.read_with(&cx, |state, _| assert_eq!(state.value(), "<named></named>"));
+    }
+
+    #[gpui::test]
+    fn linked_editing_refreshes_after_the_initial_code_editor_render(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("<name></name>", window, cx);
+                state.lsp.linked_editing_range_provider =
+                    Some(Rc::new(StaticLinkedEditingProvider));
+                state.set_cursor_position(LspPosition::new(0, 5), window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(76));
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.linked_editing_snapshot().ranges.len(), 2);
+        });
     }
 
     #[gpui::test]
