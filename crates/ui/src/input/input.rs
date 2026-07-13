@@ -323,6 +323,20 @@ impl RenderOnce for Input {
                             window.listener_for(&self.state, InputState::on_action_go_to_bracket),
                         )
                         .on_action(
+                            window.listener_for(&self.state, InputState::on_add_next_occurrence),
+                        )
+                        .on_action(
+                            window
+                                .listener_for(&self.state, InputState::on_add_previous_occurrence),
+                        )
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_select_all_occurrences),
+                        )
+                        .on_action(
+                            window
+                                .listener_for(&self.state, InputState::on_add_cursors_to_line_ends),
+                        )
+                        .on_action(
                             window.listener_for(
                                 &self.state,
                                 InputState::on_action_start_linked_editing,

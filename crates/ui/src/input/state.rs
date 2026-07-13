@@ -39,7 +39,7 @@ use crate::highlighter::DiagnosticSet;
 use crate::highlighter::LanguageRegistry;
 use crate::input::blink_cursor::CURSOR_WIDTH;
 use crate::input::movement::MoveDirection;
-use crate::input::multi_cursor::MultiCursorDelete;
+use crate::input::multi_cursor::{MultiCursorDelete, MultiCursorOccurrenceSession};
 use crate::input::{
     EditorSelection, HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
     display_map::LineLayout,
@@ -127,6 +127,10 @@ actions!(
         MoveToNextWord,
         AddCursorAbove,
         AddCursorBelow,
+        AddNextOccurrence,
+        AddPreviousOccurrence,
+        SelectAllOccurrences,
+        AddCursorsToLineEnds,
         RemoveSecondaryCursors,
         Escape,
         TriggerCompletion,
@@ -216,6 +220,15 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("ctrl-alt-up", AddCursorAbove, Some(CONTEXT)),
         #[cfg(not(target_os = "linux"))]
         KeyBinding::new("ctrl-alt-down", AddCursorBelow, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-d", AddNextOccurrence, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-d", AddNextOccurrence, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-l", SelectAllOccurrences, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-l", SelectAllOccurrences, Some(CONTEXT)),
+        KeyBinding::new("shift-alt-i", AddCursorsToLineEnds, Some(CONTEXT)),
         KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
@@ -440,6 +453,9 @@ pub struct InputState {
     pub(super) multi_cursor_editing: bool,
     /// Selection snapshots keyed by the explicit undo transaction version.
     pub(super) multi_cursor_history: BTreeMap<usize, super::multi_cursor::MultiCursorHistoryEntry>,
+    /// Search semantics retained while repeated occurrence-selection commands
+    /// grow the current multi-selection.
+    pub(super) multi_cursor_occurrence_session: Option<MultiCursorOccurrenceSession>,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<Selection>,
     pub(super) last_layout: Option<LastLayout>,
@@ -594,6 +610,7 @@ impl InputState {
             selection_reversed: false,
             multi_cursor_editing: false,
             multi_cursor_history: BTreeMap::new(),
+            multi_cursor_occurrence_session: None,
             ime_marked_range: None,
             input_bounds: Bounds::default(),
             selecting: false,
@@ -3474,6 +3491,7 @@ impl EntityInputHandler for InputState {
             self.start_undo_transaction();
         }
 
+        self.multi_cursor_occurrence_session = None;
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 

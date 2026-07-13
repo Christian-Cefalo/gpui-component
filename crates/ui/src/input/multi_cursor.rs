@@ -1,19 +1,31 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use gpui::{Context, EntityInputHandler, Window};
+use regex::RegexBuilder;
 use sum_tree::Bias;
 
 use crate::input::{
-    AddCursorAbove, AddCursorBelow, EditorSelection, InputEvent, InputState,
-    RemoveSecondaryCursors, RopeExt as _, Selection,
+    AddCursorAbove, AddCursorBelow, AddCursorsToLineEnds, AddNextOccurrence, AddPreviousOccurrence,
+    EditorSelection, InputEvent, InputState, RemoveSecondaryCursors, RopeExt as _,
+    SelectAllOccurrences, Selection,
 };
 
 pub(super) const MAX_EDITOR_SELECTIONS: usize = 256;
+const MAX_OCCURRENCE_QUERY_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct MultiCursorHistoryEntry {
     pub(super) before: Vec<EditorSelection>,
     pub(super) after: Vec<EditorSelection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MultiCursorOccurrenceSession {
+    query: String,
+    match_case: bool,
+    whole_word: bool,
+    text_version: usize,
+    last_match: Option<Range<usize>>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,6 +215,42 @@ impl InputState {
         self.add_cursor_below(cx);
     }
 
+    pub(super) fn on_add_next_occurrence(
+        &mut self,
+        _: &AddNextOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_next_occurrence(cx);
+    }
+
+    pub(super) fn on_add_previous_occurrence(
+        &mut self,
+        _: &AddPreviousOccurrence,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_previous_occurrence(cx);
+    }
+
+    pub(super) fn on_select_all_occurrences(
+        &mut self,
+        _: &SelectAllOccurrences,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_all_occurrences(cx);
+    }
+
+    pub(super) fn on_add_cursors_to_line_ends(
+        &mut self,
+        _: &AddCursorsToLineEnds,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.add_cursors_to_line_ends(cx);
+    }
+
     pub(super) fn remove_secondary_cursors(
         &mut self,
         _: &RemoveSecondaryCursors,
@@ -248,6 +296,19 @@ impl InputState {
         self.add_cursors_vertically(1, cx);
     }
 
+    /// Expand a collapsed caret to its word, then add the next literal
+    /// occurrence on repeated invocations. Matches wrap once and existing
+    /// selections are never duplicated.
+    pub fn add_next_occurrence(&mut self, cx: &mut Context<Self>) -> bool {
+        self.add_occurrence(true, cx)
+    }
+
+    /// Add the previous literal occurrence using the same retained search
+    /// session as [`Self::add_next_occurrence`].
+    pub fn add_previous_occurrence(&mut self, cx: &mut Context<Self>) -> bool {
+        self.add_occurrence(false, cx)
+    }
+
     /// Add a collapsed secondary caret at a UTF-8 byte offset. Invalid offsets
     /// are clipped to a scalar boundary and duplicate/overlapping selections
     /// are normalized away.
@@ -258,6 +319,91 @@ impl InputState {
         let mut selections = self.selections();
         selections.push(EditorSelection::caret(offset));
         self.set_editor_selections(selections, cx);
+    }
+
+    /// Select every literal occurrence of the primary selection, or every
+    /// whole-word occurrence under a collapsed primary caret. The occurrence
+    /// intersecting the original primary selection remains primary.
+    pub fn select_all_occurrences(&mut self, cx: &mut Context<Self>) -> bool {
+        let primary = self.primary_editor_selection();
+        let Some(mut session) = self.occurrence_session_for_select_all(primary) else {
+            return false;
+        };
+
+        let mut matches = Vec::with_capacity(MAX_EDITOR_SELECTIONS);
+        let mut preferred_match = None;
+        self.visit_occurrences(&session, |range| {
+            if Self::range_intersects_selection(&range, primary) {
+                preferred_match = Some(range.clone());
+            }
+            if matches.len() < MAX_EDITOR_SELECTIONS {
+                matches.push(range);
+            }
+            true
+        });
+        let Some(preferred_match) = preferred_match.or_else(|| matches.first().cloned()) else {
+            return false;
+        };
+
+        if !matches.iter().any(|range| *range == preferred_match) {
+            if matches.len() == MAX_EDITOR_SELECTIONS {
+                matches.pop();
+            }
+            matches.push(preferred_match.clone());
+        }
+        let preferred_index = matches
+            .iter()
+            .position(|range| *range == preferred_match)
+            .unwrap_or(0);
+        matches.swap(0, preferred_index);
+
+        let next = matches
+            .into_iter()
+            .map(|range| EditorSelection::from_anchor_and_head(range.start, range.end))
+            .collect::<Vec<_>>();
+        let changed = next != self.selections();
+        if !changed {
+            return false;
+        }
+        self.set_editor_selections(next, cx);
+        session.text_version = self.history.version();
+        session.last_match = Some(preferred_match);
+        self.multi_cursor_occurrence_session = Some(session);
+        true
+    }
+
+    /// Replace each non-empty selection with one caret per selected logical
+    /// line. A final line that is selected only at column zero is excluded,
+    /// matching VS Code's `Add Cursors to Line Ends` behavior.
+    pub fn add_cursors_to_line_ends(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.mode.is_single_line() {
+            return false;
+        }
+        let mut next = Vec::new();
+        for selection in self.selections() {
+            if selection.is_empty() {
+                continue;
+            }
+            let start = self.text.offset_to_point(selection.range.start);
+            let end = self.text.offset_to_point(selection.range.end);
+            for row in start.row..end.row {
+                if next.len() == MAX_EDITOR_SELECTIONS {
+                    break;
+                }
+                next.push(EditorSelection::caret(self.text.line_end_offset(row)));
+            }
+            if next.len() < MAX_EDITOR_SELECTIONS && end.column > 0 {
+                next.push(EditorSelection::caret(selection.range.end));
+            }
+            if next.len() == MAX_EDITOR_SELECTIONS {
+                break;
+            }
+        }
+        if next.is_empty() || next == self.selections() {
+            return false;
+        }
+        self.set_editor_selections(next, cx);
+        true
     }
 
     pub(super) fn secondary_editor_selections(&self) -> &[EditorSelection] {
@@ -367,6 +513,7 @@ impl InputState {
     ) {
         self.cancel_linked_editing(cx);
         self.snippet_session = None;
+        self.multi_cursor_occurrence_session = None;
         self.selected_word_range = None;
         self.set_editor_selections_internal(selections);
         self.clear_inline_completion(cx);
@@ -381,9 +528,11 @@ impl InputState {
     /// Remove every secondary selection while preserving the primary one.
     pub fn clear_secondary_selections(&mut self, cx: &mut Context<Self>) -> bool {
         if self.secondary_selections.is_empty() {
+            self.multi_cursor_occurrence_session = None;
             return false;
         }
         self.secondary_selections.clear();
+        self.multi_cursor_occurrence_session = None;
         self.refresh_bracket_match();
         cx.emit(InputEvent::SelectionChange);
         cx.notify();
@@ -400,6 +549,7 @@ impl InputState {
             .position(|selection| selection.is_empty() && selection.head() == offset)
         {
             self.secondary_selections.remove(index);
+            self.multi_cursor_occurrence_session = None;
             cx.emit(InputEvent::SelectionChange);
             cx.notify();
             return;
@@ -436,6 +586,262 @@ impl InputState {
             return;
         }
         self.set_editor_selections(next, cx);
+    }
+
+    fn occurrence_text(&self, selection: EditorSelection) -> Option<String> {
+        if selection.is_empty()
+            || selection.range.start > selection.range.end
+            || selection.range.end > self.text.len()
+        {
+            return None;
+        }
+        Some(
+            self.text
+                .slice(Range::<usize>::from(selection.range))
+                .to_string(),
+        )
+    }
+
+    fn occurrence_text_eq(left: &str, right: &str, match_case: bool) -> bool {
+        if match_case || left == right {
+            left == right
+        } else if left.eq_ignore_ascii_case(right) {
+            true
+        } else {
+            left.to_lowercase() == right.to_lowercase()
+        }
+    }
+
+    fn selection_matches_occurrence_session(
+        &self,
+        selection: EditorSelection,
+        session: &MultiCursorOccurrenceSession,
+    ) -> bool {
+        let Some(value) = self.occurrence_text(selection) else {
+            return false;
+        };
+        if !Self::occurrence_text_eq(&value, &session.query, session.match_case) {
+            return false;
+        }
+        !session.whole_word
+            || self.text.word_range(selection.range.start)
+                == Some(Range::<usize>::from(selection.range))
+    }
+
+    fn occurrence_session_is_current(&self, session: &MultiCursorOccurrenceSession) -> bool {
+        session.text_version == self.history.version()
+            && !session.query.is_empty()
+            && session.query.len() <= MAX_OCCURRENCE_QUERY_BYTES
+            && self
+                .selections()
+                .into_iter()
+                .all(|selection| self.selection_matches_occurrence_session(selection, session))
+    }
+
+    fn new_occurrence_session_from_selections(&self) -> Option<MultiCursorOccurrenceSession> {
+        let selections = self.selections();
+        let query = self.occurrence_text(*selections.first()?)?;
+        if query.is_empty() || query.len() > MAX_OCCURRENCE_QUERY_BYTES {
+            return None;
+        }
+        if !selections.iter().all(|selection| {
+            self.occurrence_text(*selection)
+                .is_some_and(|value| Self::occurrence_text_eq(&value, &query, false))
+        }) {
+            return None;
+        }
+        Some(MultiCursorOccurrenceSession {
+            query,
+            match_case: false,
+            whole_word: false,
+            text_version: self.history.version(),
+            last_match: selections
+                .last()
+                .map(|selection| Range::<usize>::from(selection.range)),
+        })
+    }
+
+    fn occurrence_session_for_add(&self) -> Option<MultiCursorOccurrenceSession> {
+        self.multi_cursor_occurrence_session
+            .as_ref()
+            .filter(|session| self.occurrence_session_is_current(session))
+            .cloned()
+            .or_else(|| self.new_occurrence_session_from_selections())
+    }
+
+    fn occurrence_session_for_select_all(
+        &self,
+        primary: EditorSelection,
+    ) -> Option<MultiCursorOccurrenceSession> {
+        if let Some(session) = self
+            .multi_cursor_occurrence_session
+            .as_ref()
+            .filter(|session| self.occurrence_session_is_current(session))
+        {
+            return Some(session.clone());
+        }
+
+        let (range, match_case, whole_word) = if primary.is_empty() {
+            (self.text.word_range(primary.head())?, true, true)
+        } else {
+            (Range::<usize>::from(primary.range), false, false)
+        };
+        let query = self.text.slice(range.clone()).to_string();
+        if query.is_empty() || query.len() > MAX_OCCURRENCE_QUERY_BYTES {
+            return None;
+        }
+        Some(MultiCursorOccurrenceSession {
+            query,
+            match_case,
+            whole_word,
+            text_version: self.history.version(),
+            last_match: Some(range),
+        })
+    }
+
+    fn expand_collapsed_occurrence_selections(&mut self, cx: &mut Context<Self>) -> Option<bool> {
+        let current = self.selections();
+        if !current.iter().any(EditorSelection::is_empty) {
+            return None;
+        }
+        let next = current
+            .iter()
+            .copied()
+            .map(|selection| {
+                if !selection.is_empty() {
+                    return selection;
+                }
+                self.text
+                    .word_range(selection.head())
+                    .map(|range| EditorSelection::from_anchor_and_head(range.start, range.end))
+                    .unwrap_or(selection)
+            })
+            .collect::<Vec<_>>();
+        let changed = next != current;
+        if !changed {
+            self.multi_cursor_occurrence_session = None;
+            return Some(false);
+        }
+
+        let single_session = (current.len() == 1).then(|| {
+            let range = Range::<usize>::from(next[0].range);
+            MultiCursorOccurrenceSession {
+                query: self.text.slice(range.clone()).to_string(),
+                match_case: true,
+                whole_word: true,
+                text_version: self.history.version(),
+                last_match: Some(range),
+            }
+        });
+        self.set_editor_selections(next, cx);
+        self.multi_cursor_occurrence_session = single_session.filter(|session| {
+            !session.query.is_empty() && session.query.len() <= MAX_OCCURRENCE_QUERY_BYTES
+        });
+        Some(true)
+    }
+
+    fn visit_occurrences(
+        &self,
+        session: &MultiCursorOccurrenceSession,
+        mut visit: impl FnMut(Range<usize>) -> bool,
+    ) {
+        if session.query.is_empty() || session.query.len() > MAX_OCCURRENCE_QUERY_BYTES {
+            return;
+        }
+        let escaped = regex::escape(&session.query);
+        let mut builder = RegexBuilder::new(&escaped);
+        builder.case_insensitive(!session.match_case).unicode(true);
+        let Ok(matcher) = builder.build() else {
+            return;
+        };
+        let text = self.text.to_string();
+        for found in matcher.find_iter(&text) {
+            let range = found.start()..found.end();
+            if session.whole_word && self.text.word_range(range.start) != Some(range.clone()) {
+                continue;
+            }
+            if !visit(range) {
+                break;
+            }
+        }
+    }
+
+    fn range_intersects_selection(range: &Range<usize>, selection: EditorSelection) -> bool {
+        if selection.is_empty() {
+            range.start <= selection.head() && selection.head() <= range.end
+        } else {
+            range.start < selection.range.end && selection.range.start < range.end
+        }
+    }
+
+    fn add_occurrence(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        if let Some(changed) = self.expand_collapsed_occurrence_selections(cx) {
+            return changed;
+        }
+        if self.selections().len() >= MAX_EDITOR_SELECTIONS {
+            return false;
+        }
+        let Some(mut session) = self.occurrence_session_for_add() else {
+            self.multi_cursor_occurrence_session = None;
+            return false;
+        };
+        let selected = self
+            .selections()
+            .into_iter()
+            .map(|selection| Range::<usize>::from(selection.range))
+            .collect::<Vec<_>>();
+        let already_selected = |range: &Range<usize>| selected.iter().any(|item| item == range);
+
+        let candidate = if forward {
+            let boundary = session.last_match.as_ref().map_or(0, |range| range.end);
+            let mut wrapped = None;
+            let mut after = None;
+            self.visit_occurrences(&session, |range| {
+                if already_selected(&range) {
+                    return true;
+                }
+                wrapped.get_or_insert_with(|| range.clone());
+                if range.start >= boundary {
+                    after = Some(range);
+                    return false;
+                }
+                true
+            });
+            after.or(wrapped)
+        } else {
+            let boundary = session
+                .last_match
+                .as_ref()
+                .map_or(self.text.len(), |range| range.start);
+            let mut before = None;
+            let mut wrapped = None;
+            self.visit_occurrences(&session, |range| {
+                if already_selected(&range) {
+                    return true;
+                }
+                if range.end <= boundary {
+                    before = Some(range.clone());
+                }
+                wrapped = Some(range);
+                true
+            });
+            before.or(wrapped)
+        };
+        let Some(candidate) = candidate else {
+            self.multi_cursor_occurrence_session = Some(session);
+            return false;
+        };
+
+        let mut next = self.selections();
+        next.push(EditorSelection::from_anchor_and_head(
+            candidate.start,
+            candidate.end,
+        ));
+        self.set_editor_selections(next, cx);
+        session.text_version = self.history.version();
+        session.last_match = Some(candidate);
+        self.multi_cursor_occurrence_session = Some(session);
+        true
     }
 
     fn shift_selection_after_edit(
@@ -891,6 +1297,170 @@ mod tests {
                 assert_eq!(
                     state.selections(),
                     vec![EditorSelection::from_anchor_and_head(1, 4)]
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn repeated_occurrence_selection_expands_then_grows_without_duplicates(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("abc pizza\nabc house\nabc bar", window, cx);
+                state.set_editor_selections([EditorSelection::caret(1)], cx);
+
+                assert!(state.add_next_occurrence(cx));
+                assert_eq!(
+                    state.selections(),
+                    vec![EditorSelection::from_anchor_and_head(0, 3)]
+                );
+                assert!(state.add_next_occurrence(cx));
+                assert!(state.add_next_occurrence(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![0..3, 10..13, 20..23]
+                );
+                assert!(!state.add_next_occurrence(cx));
+
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(10, 13)], cx);
+                assert!(state.add_previous_occurrence(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![10..13, 0..3]
+                );
+                assert!(state.multi_cursor_occurrence_session.is_some());
+                assert!(state.clear_secondary_selections(cx));
+                assert!(state.multi_cursor_occurrence_session.is_none());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn occurrence_selection_keeps_touching_matches_and_collapsed_word_rules(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("abcabc", window, cx);
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(0, 3)], cx);
+                assert!(state.add_next_occurrence(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![0..3, 3..6]
+                );
+
+                state.set_value("test testte Test test", window, cx);
+                state.set_editor_selections([EditorSelection::caret(1)], cx);
+                assert!(state.add_next_occurrence(cx));
+                assert!(state.add_next_occurrence(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![0..4, 17..21]
+                );
+
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(0, 4)], cx);
+                assert!(state.add_next_occurrence(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![0..4, 5..9]
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn select_all_occurrences_preserves_primary_and_whole_word_boundaries(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("one oneX one\none", window, cx);
+                state.set_editor_selections([EditorSelection::caret(10)], cx);
+                assert!(state.select_all_occurrences(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![9..12, 0..3, 13..16]
+                );
+
+                let many = (0..300).map(|_| "x").collect::<Vec<_>>().join(" ");
+                state.set_value(many, window, cx);
+                let preferred = 290 * 2;
+                state.set_editor_selections([EditorSelection::caret(preferred)], cx);
+                assert!(state.select_all_occurrences(cx));
+                assert_eq!(state.selections().len(), MAX_EDITOR_SELECTIONS);
+                assert_eq!(
+                    Range::<usize>::from(state.selections()[0].range),
+                    preferred..preferred + 1
+                );
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn add_cursors_to_line_ends_excludes_column_zero_final_line(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha\nbeta\ngamma", window, cx);
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(1, 11)], cx);
+                assert!(state.add_cursors_to_line_ends(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![5, 10]
+                );
+
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(1, 13)], cx);
+                assert!(state.add_cursors_to_line_ends(cx));
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![5, 10, 13]
                 );
             });
         });
