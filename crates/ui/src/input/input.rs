@@ -315,6 +315,11 @@ impl RenderOnce for Input {
                             InputState::on_action_trigger_parameter_hints,
                         ),
                     )
+                    .when(state.mode.is_code_editor(), |this| {
+                        this.on_action(
+                            window.listener_for(&self.state, InputState::on_action_go_to_bracket),
+                        )
+                    })
                     .when(state.mode.is_multi_line(), |this| {
                         this.on_action(window.listener_for(&self.state, InputState::indent_inline))
                             .on_action(window.listener_for(&self.state, InputState::outdent_inline))

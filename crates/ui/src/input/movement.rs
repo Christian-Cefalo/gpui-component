@@ -54,6 +54,7 @@ impl InputState {
         self.hide_context_menu(cx);
         self.clear_inline_completion(cx);
         self.retrigger_signature_help_after_cursor_move(cx);
+        self.refresh_bracket_match();
         cx.emit(crate::input::InputEvent::SelectionChange);
         cx.notify()
     }

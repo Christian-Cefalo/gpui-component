@@ -42,6 +42,10 @@ use crate::input::{
     HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
+    pairs::{
+        BracketMatch, PairTypingPlan, TrackedAutoClosingPair, adjust_tracked_pairs_for_edit,
+        bracket_match_near, bracket_navigation_target, pair_typing_plan,
+    },
     popovers::{ContextMenu, DiagnosticPopover, HoverPopover, SignatureHelpPopover},
     search::SearchPanel,
     snippet::SnippetSession,
@@ -123,6 +127,7 @@ actions!(
         GoToDefinition,
         OpenDocumentLink,
         TriggerParameterHints,
+        GoToBracket,
     ]
 );
 
@@ -199,6 +204,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-space", TriggerParameterHints, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-space", TriggerParameterHints, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-\\", GoToBracket, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-\\", GoToBracket, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -472,6 +481,9 @@ pub struct InputState {
     /// Mirror updates are editor-owned and must not be treated as user edits
     /// to the active snippet placeholder.
     pub(super) snippet_tracking_suspended: bool,
+    pub(super) language_configuration: super::EditorLanguageConfiguration,
+    pub(super) tracked_auto_closing_pairs: Vec<TrackedAutoClosingPair>,
+    pub(super) bracket_match: Option<BracketMatch>,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
     pub(super) signature_help_popover: Option<Entity<SignatureHelpPopover>>,
     /// The LSP definitions locations for "Go to Definition" feature.
@@ -590,6 +602,9 @@ impl InputState {
             snippet_variable_context: SnippetVariableContext::default(),
             snippet_session: None,
             snippet_tracking_suspended: false,
+            language_configuration: super::EditorLanguageConfiguration::default(),
+            tracked_auto_closing_pairs: Vec::new(),
+            bracket_match: None,
             hover_popover: None,
             signature_help_popover: None,
             hover_definition: HoverDefinition::default(),
@@ -645,6 +660,67 @@ impl InputState {
         self.mode = InputMode::code_editor(language);
         self.searchable = true;
         self
+    }
+
+    /// Set the data-driven language rules used for matching, automatic closing,
+    /// close-character overtype, selection surround, and paired backspace.
+    pub fn language_configuration(
+        mut self,
+        configuration: super::EditorLanguageConfiguration,
+    ) -> Self {
+        self.language_configuration = configuration.normalized();
+        self
+    }
+
+    /// Replace the active editor language rules at runtime.
+    pub fn set_language_configuration(
+        &mut self,
+        configuration: super::EditorLanguageConfiguration,
+        cx: &mut Context<Self>,
+    ) {
+        self.language_configuration = configuration.normalized();
+        self.tracked_auto_closing_pairs.clear();
+        self.refresh_bracket_match();
+        cx.notify();
+    }
+
+    pub fn language_configuration_ref(&self) -> &super::EditorLanguageConfiguration {
+        &self.language_configuration
+    }
+
+    /// Matching bracket byte ranges near the caret, if both sides are within
+    /// the editor's bounded scan window.
+    pub fn matching_bracket_ranges(&self) -> Option<(Range<usize>, Range<usize>)> {
+        self.bracket_match
+            .as_ref()
+            .map(|matched| (matched.open.clone(), matched.close.clone()))
+    }
+
+    /// Move to the matching, enclosing, or next bracket using VS Code's
+    /// Ctrl/Cmd+Shift+Backslash interaction order.
+    pub fn go_to_bracket(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.mode.is_code_editor() || self.language_configuration.brackets().is_empty() {
+            return false;
+        }
+        let cursor = self.cursor();
+        let (base, text) = self.pair_text_window(cursor, 512 * 1024, 512 * 1024);
+        let local_cursor = cursor.saturating_sub(base).min(text.len());
+        let Some(target) =
+            bracket_navigation_target(&text, local_cursor, &self.language_configuration)
+        else {
+            return false;
+        };
+        self.move_to(base + target, None, cx);
+        true
+    }
+
+    pub(super) fn on_action_go_to_bracket(
+        &mut self,
+        _: &GoToBracket,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.go_to_bracket(cx);
     }
 
     /// Set stable document/workspace metadata used to resolve TextMate
@@ -868,6 +944,8 @@ impl InputState {
 
         self.reset_selection();
         self.reset_lsp_state();
+        self.tracked_auto_closing_pairs.clear();
+        self.refresh_bracket_match();
         self.reset_scroll_to_start();
 
         self.history.clear();
@@ -892,6 +970,7 @@ impl InputState {
         self.replace_text(text, window, cx);
         self.reset_selection();
         self.reset_lsp_state();
+        self.refresh_bracket_match();
         self.reset_scroll_to_start();
 
         cx.notify();
@@ -1352,6 +1431,7 @@ impl InputState {
         self.selected_range = (0..self.text.len()).into();
         self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
+        self.refresh_bracket_match();
         cx.emit(InputEvent::SelectionChange);
         cx.notify();
     }
@@ -1562,6 +1642,14 @@ impl InputState {
     }
 
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_range.is_empty()
+            && let Some(range) = self.paired_backspace_range()
+        {
+            self.selected_range = range.into();
+            self.replace_text_in_range(None, "", window, cx);
+            self.pause_blink_cursor(cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.previous_boundary(self.cursor()), cx)
         }
@@ -2345,6 +2433,7 @@ impl InputState {
             self.update_preferred_column();
         }
         self.cancel_snippet_session_if_selection_outside(cx);
+        self.refresh_bracket_match();
         cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
@@ -2355,6 +2444,7 @@ impl InputState {
         self.selected_range = (offset..offset).into();
         self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
+        self.refresh_bracket_match();
         cx.emit(InputEvent::SelectionChange);
         cx.notify()
     }
@@ -2567,6 +2657,134 @@ impl InputState {
                 }
             });
         }
+    }
+
+    fn pair_text_window(
+        &self,
+        center: usize,
+        before_bytes: usize,
+        after_bytes: usize,
+    ) -> (usize, String) {
+        let center = center.min(self.text.len());
+        let start = self
+            .text
+            .clip_offset(center.saturating_sub(before_bytes), Bias::Left);
+        let end = self.text.clip_offset(
+            center.saturating_add(after_bytes).min(self.text.len()),
+            Bias::Right,
+        );
+        (start, self.text.slice(start..end).to_string())
+    }
+
+    fn pair_typing_plan_for_edit(
+        &self,
+        range: &Range<usize>,
+        typed: &str,
+    ) -> Option<PairTypingPlan> {
+        if !self.mode.is_code_editor() || self.language_configuration.is_empty() {
+            return None;
+        }
+        let start = self
+            .text
+            .clip_offset(range.start.saturating_sub(64 * 1024), Bias::Left);
+        let end = self.text.clip_offset(
+            range.end.saturating_add(256).min(self.text.len()),
+            Bias::Right,
+        );
+        let text = self.text.slice(start..end).to_string();
+        let mut plan = pair_typing_plan(
+            &text,
+            range.start.saturating_sub(start)..range.end.saturating_sub(start),
+            typed,
+            &self.language_configuration,
+        )?;
+        plan.selection_after.start += start;
+        plan.selection_after.end += start;
+        if let Some(tracked) = plan.tracked_pair.as_mut() {
+            tracked.open.start += start;
+            tracked.open.end += start;
+            tracked.close.start += start;
+            tracked.close.end += start;
+        }
+        Some(plan)
+    }
+
+    fn local_tracked_pairs(&self, base: usize, end: usize) -> Vec<TrackedAutoClosingPair> {
+        self.tracked_auto_closing_pairs
+            .iter()
+            .filter(|pair| pair.open.start >= base && pair.close.end <= end)
+            .map(|pair| TrackedAutoClosingPair {
+                open: pair.open.start - base..pair.open.end - base,
+                close: pair.close.start - base..pair.close.end - base,
+                open_text: pair.open_text.clone(),
+                close_text: pair.close_text.clone(),
+            })
+            .collect()
+    }
+
+    fn try_overtype_auto_closing_pair(
+        &mut self,
+        range: &Range<usize>,
+        typed: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !range.is_empty() || typed.chars().count() != 1 {
+            return false;
+        }
+        let cursor = range.start;
+        let (base, text) = self.pair_text_window(cursor, 64, 64);
+        let tracked = self.local_tracked_pairs(base, base + text.len());
+        let Some((_, target)) =
+            super::pairs::overtype_target(&text, cursor.saturating_sub(base), typed, &tracked)
+        else {
+            return false;
+        };
+        let target = base + target;
+        self.tracked_auto_closing_pairs
+            .retain(|pair| pair.close.start != cursor || pair.close_text != typed);
+        self.move_to(target, None, cx);
+        true
+    }
+
+    fn paired_backspace_range(&self) -> Option<Range<usize>> {
+        let cursor = self.cursor();
+        let (base, text) = self.pair_text_window(cursor, 64, 64);
+        let tracked = self.local_tracked_pairs(base, base + text.len());
+        super::pairs::paired_backspace_range(&text, cursor.saturating_sub(base), &tracked)
+            .map(|range| base + range.start..base + range.end)
+    }
+
+    pub(super) fn refresh_bracket_match(&mut self) {
+        if !self.mode.is_code_editor()
+            || !self.selected_range.is_empty()
+            || self.language_configuration.brackets().is_empty()
+        {
+            self.bracket_match = None;
+            return;
+        }
+        let cursor = self.cursor();
+        let (near_base, near) = self.pair_text_window(cursor, 32, 32);
+        let local_cursor = cursor.saturating_sub(near_base).min(near.len());
+        let touches_bracket = self.language_configuration.brackets().iter().any(|pair| {
+            near[local_cursor..].starts_with(&pair.open)
+                || near[local_cursor..].starts_with(&pair.close)
+                || near[..local_cursor].ends_with(&pair.open)
+                || near[..local_cursor].ends_with(&pair.close)
+        });
+        if !touches_bracket {
+            self.bracket_match = None;
+            return;
+        }
+        let (base, text) = self.pair_text_window(cursor, 64 * 1024, 64 * 1024);
+        let local_cursor = cursor.saturating_sub(base).min(text.len());
+        self.bracket_match = bracket_match_near(&text, local_cursor, &self.language_configuration)
+            .map(|mut matched| {
+                matched.open.start += base;
+                matched.open.end += base;
+                matched.close.start += base;
+                matched.close.end += base;
+                matched
+            });
     }
 
     /// Normalize the inserted text before applying it to the input.
@@ -2974,6 +3192,22 @@ impl EntityInputHandler for InputState {
             }))
             .unwrap_or(self.selected_range.into());
 
+        if !self.silent_replace_text
+            && self.ime_marked_range.is_none()
+            && self.try_overtype_auto_closing_pair(&range, new_text, cx)
+        {
+            return;
+        }
+        let pair_plan = if !self.silent_replace_text && self.ime_marked_range.is_none() {
+            self.pair_typing_plan_for_edit(&range, new_text)
+        } else {
+            None
+        };
+        let new_text = pair_plan
+            .as_ref()
+            .map(|plan| plan.replacement.as_str())
+            .unwrap_or(new_text);
+
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 
@@ -3008,14 +3242,28 @@ impl EntityInputHandler for InputState {
         }
 
         if mask_changed {
+            self.tracked_auto_closing_pairs.clear();
             self.snippet_session = None;
-        } else if !self.snippet_tracking_suspended {
-            let ranges_still_valid = self
-                .snippet_session
-                .as_mut()
-                .is_none_or(|session| session.track_user_edit(range.clone(), new_text.len()));
-            if !ranges_still_valid {
-                self.snippet_session = None;
+        } else {
+            adjust_tracked_pairs_for_edit(
+                &mut self.tracked_auto_closing_pairs,
+                &range,
+                new_text.len(),
+            );
+            if let Some(tracked) = pair_plan
+                .as_ref()
+                .and_then(|plan| plan.tracked_pair.clone())
+            {
+                self.tracked_auto_closing_pairs.push(tracked);
+            }
+            if !self.snippet_tracking_suspended {
+                let ranges_still_valid = self
+                    .snippet_session
+                    .as_mut()
+                    .is_none_or(|session| session.track_user_edit(range.clone(), new_text.len()));
+                if !ranges_still_valid {
+                    self.snippet_session = None;
+                }
             }
         }
 
@@ -3046,7 +3294,10 @@ impl EntityInputHandler for InputState {
 
         self.update_fold_candidates_incremental(&range, new_text);
         self.lsp.update(&self.text, window, cx);
-        self.selected_range = (new_offset..new_offset).into();
+        self.selected_range = pair_plan
+            .as_ref()
+            .map(|plan| plan.selection_after.clone().into())
+            .unwrap_or_else(|| (new_offset..new_offset).into());
         self.ime_marked_range.take();
         self.update_preferred_column();
         self.update_search(cx);
@@ -3065,6 +3316,7 @@ impl EntityInputHandler for InputState {
             cx.emit(InputEvent::Change);
             cx.emit(InputEvent::SelectionChange);
         }
+        self.refresh_bracket_match();
         cx.notify();
     }
 
@@ -3289,7 +3541,10 @@ impl Render for InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{CodeLensProvider, DocumentLinkProvider, SignatureHelpProvider};
+    use crate::input::{
+        CodeLensProvider, DocumentLinkProvider, EditorAutoClosingPair, EditorLanguageConfiguration,
+        EditorTokenContext, SignatureHelpProvider,
+    };
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
     use lsp_types::{
@@ -3335,6 +3590,21 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    fn rust_pair_configuration() -> EditorLanguageConfiguration {
+        EditorLanguageConfiguration::new()
+            .with_brackets([("{", "}"), ("[", "]"), ("(", ")")])
+            .with_auto_closing_pairs([
+                EditorAutoClosingPair::new("{", "}"),
+                EditorAutoClosingPair::new("[", "]"),
+                EditorAutoClosingPair::new("(", ")"),
+                EditorAutoClosingPair::new("\"", "\"").not_in([EditorTokenContext::String]),
+            ])
+            .with_surrounding_pairs([("{", "}"), ("[", "]"), ("(", ")"), ("\"", "\"")])
+            .with_line_comment("//")
+            .with_block_comment("/*", "*/")
+            .with_string_delimiters(["\""])
     }
 
     struct StaticCodeLensProvider;
@@ -3563,6 +3833,104 @@ mod tests {
             2,
             "superseded delayed request must not dispatch"
         );
+    }
+
+    #[gpui::test]
+    fn editor_pairs_auto_close_overtype_surround_and_delete_only_owned_pairs(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::build(cx, |state| {
+            state
+                .code_editor("rust")
+                .language_configuration(rust_pair_configuration())
+        });
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("call", window, cx);
+                state.move_to(4, None, cx);
+                state.replace_text_in_range(None, "(", window, cx);
+                assert_eq!(state.value(), "call()");
+                assert_eq!(state.selected_range, Selection::new(5, 5));
+                assert_eq!(state.tracked_auto_closing_pairs.len(), 1);
+
+                state.replace_text_in_range(None, ")", window, cx);
+                assert_eq!(state.value(), "call()");
+                assert_eq!(state.selected_range, Selection::new(6, 6));
+                assert!(state.tracked_auto_closing_pairs.is_empty());
+
+                state.set_value("é", window, cx);
+                state.move_to("é".len(), None, cx);
+                state.replace_text_in_range(None, "(", window, cx);
+                assert_eq!(state.value(), "é()");
+                assert_eq!(state.selected_range, Selection::new(3, 3));
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), "é");
+
+                state.set_value("value", window, cx);
+                state.selected_range = Selection::new(0, 5);
+                state.replace_text_in_range(None, "(", window, cx);
+                assert_eq!(state.value(), "(value)");
+                assert_eq!(state.selected_range, Selection::new(1, 6));
+
+                state.set_value("()", window, cx);
+                state.move_to(1, None, cx);
+                state.backspace(&Backspace, window, cx);
+                assert_eq!(state.value(), ")", "manual adjacency is not pair-owned");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn bracket_match_and_go_to_bracket_ignore_configured_strings_and_comments(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::build(cx, |state| {
+            state
+                .code_editor("rust")
+                .language_configuration(rust_pair_configuration())
+        });
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let text = "fn main() { let value = \"}\"; /* ] */ call([1]); }";
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(text, window, cx);
+                let open = text.find('{').unwrap();
+                let close = text.rfind('}').unwrap();
+                state.move_to(open + 1, None, cx);
+                assert_eq!(
+                    state.matching_bracket_ranges(),
+                    Some((open..open + 1, close..close + 1))
+                );
+                assert!(state.go_to_bracket(cx));
+                assert_eq!(state.cursor(), close);
+
+                state.move_to(text.find("call").unwrap() + 4, None, cx);
+                assert!(state.go_to_bracket(cx));
+                assert_eq!(state.cursor(), text.find("]);").unwrap() + 1);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn code_editor_without_language_pair_configuration_preserves_literal_typing(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+                state.replace_text_in_range(None, "(", window, cx);
+                assert_eq!(state.value(), "(");
+                assert!(state.matching_bracket_ranges().is_none());
+            });
+        });
     }
 
     #[gpui::test]

@@ -800,6 +800,21 @@ impl TextElement {
             .collect()
     }
 
+    fn layout_bracket_matches(
+        &self,
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+        cx: &mut App,
+    ) -> Vec<Path<Pixels>> {
+        self.state
+            .read(cx)
+            .matching_bracket_ranges()
+            .into_iter()
+            .flat_map(|(open, close)| [open, close])
+            .filter_map(|range| Self::layout_match_range(range, last_layout, bounds))
+            .collect()
+    }
+
     fn layout_selections(
         &self,
         last_layout: &LastLayout,
@@ -1603,6 +1618,7 @@ pub(super) struct PrepaintState {
     /// row index (zero based), no wrap, same line as the cursor.
     current_row: Option<usize>,
     selection_path: Option<Path<Pixels>>,
+    bracket_match_paths: Vec<Path<Pixels>>,
     hover_highlight_path: Option<Path<Pixels>>,
     search_match_paths: Vec<(Path<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
@@ -2055,6 +2071,7 @@ impl Element for TextElement {
 
         let search_match_paths = self.layout_search_matches(&last_layout, &mut bounds, cx);
         let selection_path = self.layout_selections(&last_layout, &mut bounds, window, cx);
+        let bracket_match_paths = self.layout_bracket_matches(&last_layout, &bounds, cx);
         let hover_highlight_path = self.layout_hover_highlight(&last_layout, &mut bounds, cx);
         let document_color_paths =
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
@@ -2140,6 +2157,7 @@ impl Element for TextElement {
             cursor_scroll_offset,
             current_row,
             selection_path,
+            bracket_match_paths,
             search_match_paths,
             hover_highlight_path,
             hover_definition_hitbox,
@@ -2270,6 +2288,9 @@ impl Element for TextElement {
                     _ => cx.theme().selection.opacity(0.2),
                 };
                 window.paint_path(path.clone(), color);
+            }
+            for path in prepaint.bracket_match_paths.iter() {
+                window.paint_path(path.clone(), cx.theme().selection.opacity(0.32));
             }
             for (path, is_active) in prepaint.search_match_paths.iter() {
                 window.paint_path(path.clone(), secondary_selection);

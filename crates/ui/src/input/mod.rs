@@ -15,6 +15,7 @@ mod mode;
 mod movement;
 mod number_input;
 mod otp_input;
+mod pairs;
 pub(crate) mod popovers;
 mod rope_ext;
 mod search;
@@ -37,6 +38,9 @@ pub use lsp_types::Position;
 pub use mask_pattern::MaskPattern;
 pub use number_input::{NumberInput, NumberInputEvent, NumberStep, StepAction};
 pub use otp_input::*;
+pub use pairs::{
+    EditorAutoClosingPair, EditorCharacterPair, EditorLanguageConfiguration, EditorTokenContext,
+};
 pub use rope_ext::{InputEdit, Point, RopeExt, RopeLines};
 pub use ropey::Rope;
 pub use snippet_variables::SnippetVariableContext;
