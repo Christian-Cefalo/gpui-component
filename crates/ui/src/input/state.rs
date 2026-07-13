@@ -128,6 +128,7 @@ actions!(
         OpenDocumentLink,
         TriggerParameterHints,
         GoToBracket,
+        StartLinkedEditing,
     ]
 );
 
@@ -208,6 +209,10 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-\\", GoToBracket, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-\\", GoToBracket, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-f2", StartLinkedEditing, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-f2", StartLinkedEditing, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -481,6 +486,9 @@ pub struct InputState {
     /// Mirror updates are editor-owned and must not be treated as user edits
     /// to the active snippet placeholder.
     pub(super) snippet_tracking_suspended: bool,
+    /// Linked mirror mutations and undo replay must not recursively start a
+    /// second linked-editing transaction.
+    pub(super) linked_editing_tracking_suspended: bool,
     pub(super) language_configuration: super::EditorLanguageConfiguration,
     pub(super) tracked_auto_closing_pairs: Vec<TrackedAutoClosingPair>,
     pub(super) bracket_match: Option<BracketMatch>,
@@ -602,6 +610,7 @@ impl InputState {
             snippet_variable_context: SnippetVariableContext::default(),
             snippet_session: None,
             snippet_tracking_suspended: false,
+            linked_editing_tracking_suspended: false,
             language_configuration: super::EditorLanguageConfiguration::default(),
             tracked_auto_closing_pairs: Vec::new(),
             bracket_match: None,
@@ -1847,6 +1856,10 @@ impl InputState {
             return;
         }
 
+        if self.cancel_linked_editing(cx) {
+            return;
+        }
+
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
         }
@@ -1887,6 +1900,7 @@ impl InputState {
             let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
             let has_document_link = is_enable && self.has_document_link_at_cursor();
             let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
+            let has_linked_editing = is_enable && self.lsp.linked_editing_range_provider.is_some();
             let is_selected = !self.selected_range.is_empty();
             let has_paste = is_enable && cx.read_from_clipboard().is_some();
 
@@ -1907,6 +1921,11 @@ impl InputState {
                         rust_i18n::t!("Input.Show Code Actions"),
                         !has_code_action,
                         Box::new(crate::input::ToggleCodeActions),
+                    )
+                    .menu_with_disabled(
+                        "Start Linked Editing",
+                        !has_linked_editing,
+                        Box::new(crate::input::StartLinkedEditing),
                     )
                     .separator();
             }
@@ -2288,6 +2307,8 @@ impl InputState {
     }
 
     pub(super) fn undo(&mut self, _: &Undo, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_linked_editing(cx);
+        self.linked_editing_tracking_suspended = true;
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
             for change in changes {
@@ -2296,9 +2317,12 @@ impl InputState {
             }
         }
         self.history.ignore = false;
+        self.linked_editing_tracking_suspended = false;
     }
 
     pub(super) fn redo(&mut self, _: &Redo, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_linked_editing(cx);
+        self.linked_editing_tracking_suspended = true;
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
             for change in changes {
@@ -2307,6 +2331,7 @@ impl InputState {
             }
         }
         self.history.ignore = false;
+        self.linked_editing_tracking_suspended = false;
     }
 
     /// Get byte offset of the cursor.
@@ -3257,6 +3282,11 @@ impl EntityInputHandler for InputState {
             .map(|plan| plan.replacement.as_str())
             .unwrap_or(new_text);
 
+        let linked_editing_transaction = self.prepare_linked_editing_edit(&range, new_text.len());
+        if linked_editing_transaction {
+            self.start_undo_transaction();
+        }
+
         let old_text = self.text.clone();
         self.text.replace(range.clone(), new_text);
 
@@ -3356,6 +3386,13 @@ impl EntityInputHandler for InputState {
             self.synchronize_active_snippet_mirrors(window, cx);
             self.selected_range = selection_after_user_edit;
             self.update_preferred_column();
+        }
+        if linked_editing_transaction {
+            let selection_after_user_edit = self.selected_range;
+            self.synchronize_linked_editing_mirrors(window, cx);
+            self.selected_range = selection_after_user_edit;
+            self.update_preferred_column();
+            self.end_undo_transaction();
         }
         self.handle_signature_help_text_change(!self.silent_replace_text, cx);
         if !self.silent_replace_text {
@@ -3596,14 +3633,15 @@ mod tests {
     use crate::input::{
         CodeActionProvider, CodeActionTrigger, CodeLensProvider, DocumentLinkProvider,
         EditorAutoClosingPair, EditorLanguageConfiguration, EditorTokenContext,
-        SignatureHelpProvider,
+        LinkedEditingRangeProvider, SignatureHelpProvider,
     };
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
     use lsp_types::{
         CodeAction, CodeActionKind, CodeLens, Command, DocumentLink, Hover, HoverContents,
-        MarkedString, ParameterInformation, ParameterLabel, Position as LspPosition,
-        Range as LspRange, SignatureHelp, SignatureHelpContext, SignatureInformation,
+        LinkedEditingRanges, MarkedString, ParameterInformation, ParameterLabel,
+        Position as LspPosition, Range as LspRange, SignatureHelp, SignatureHelpContext,
+        SignatureInformation,
     };
     use std::{cell::RefCell, time::Duration};
 
@@ -3670,6 +3708,8 @@ mod tests {
         calls: Rc<Cell<usize>>,
         contexts: Rc<RefCell<Vec<SignatureHelpContext>>>,
     }
+
+    struct StaticLinkedEditingProvider;
 
     struct StaticCodeActionProvider {
         triggers: Rc<RefCell<Vec<CodeActionTrigger>>>,
@@ -3806,6 +3846,78 @@ mod tests {
                 active_parameter: Some(0),
             })))
         }
+    }
+
+    impl LinkedEditingRangeProvider for StaticLinkedEditingProvider {
+        fn linked_editing_ranges(
+            &self,
+            _text: &Rope,
+            _position: LspPosition,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Option<LinkedEditingRanges>>> {
+            Task::ready(Ok(Some(LinkedEditingRanges {
+                ranges: vec![
+                    LspRange::new(LspPosition::new(0, 1), LspPosition::new(0, 5)),
+                    LspRange::new(LspPosition::new(0, 8), LspPosition::new(0, 12)),
+                ],
+                word_pattern: Some(r"^[a-z]+$".to_string()),
+            })))
+        }
+    }
+
+    #[gpui::test]
+    fn linked_editing_mirrors_as_one_undoable_transaction(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("<name></name>", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.lsp.linked_editing_range_provider =
+                    Some(Rc::new(StaticLinkedEditingProvider));
+                state.set_cursor_position(LspPosition::new(0, 5), window, cx);
+                assert_eq!(state.cursor(), 5);
+                state.start_linked_editing(window, cx);
+                assert!(state.linked_editing_snapshot().pending);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                let snapshot = state.linked_editing_snapshot();
+                assert_eq!(
+                    snapshot.ranges.len(),
+                    2,
+                    "linked-editing state: {snapshot:?}; cursor: {}; text: {}",
+                    state.cursor(),
+                    state.value()
+                );
+                state.insert("d", window, cx);
+                assert_eq!(state.value(), "<named></named>");
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.undo(&Undo, window, cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "<name></name>");
+            assert!(state.linked_editing_snapshot().ranges.is_empty());
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.redo(&Redo, window, cx));
+        });
+        input.read_with(&cx, |state, _| assert_eq!(state.value(), "<named></named>"));
     }
 
     #[gpui::test]

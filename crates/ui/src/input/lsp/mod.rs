@@ -19,6 +19,7 @@ mod document_links;
 mod folding_ranges;
 mod hover;
 mod inlay_hints;
+mod linked_editing;
 mod refresh;
 mod selection_ranges;
 mod semantic_tokens;
@@ -34,6 +35,7 @@ pub use document_links::*;
 pub use folding_ranges::*;
 pub use hover::*;
 pub use inlay_hints::*;
+pub use linked_editing::*;
 pub use selection_ranges::*;
 pub use semantic_tokens::*;
 pub use signature_help::*;
@@ -65,6 +67,8 @@ pub struct Lsp {
     pub folding_range_provider: Option<Rc<dyn FoldingRangeProvider>>,
     /// The viewport inlay-hint provider.
     pub inlay_hint_provider: Option<Rc<dyn InlayHintProvider>>,
+    /// The linked-editing range provider used for rename-on-type behavior.
+    pub linked_editing_range_provider: Option<Rc<dyn LinkedEditingRangeProvider>>,
     /// The smart expand-selection provider.
     pub selection_range_provider: Option<Rc<dyn SelectionRangeProvider>>,
     /// The range semantic tokens provider.
@@ -90,6 +94,11 @@ pub struct Lsp {
     inlay_hint_resolved: Vec<bool>,
     inlay_hint_resolve_actions: Vec<Option<inlay_hints::PendingInlayHintAction>>,
     active_inlay_hint: Option<InlayHintIdentity>,
+    linked_editing_ranges: Vec<ByteRange<usize>>,
+    linked_editing_word_pattern: Option<String>,
+    linked_editing_regex: Option<regex::Regex>,
+    linked_editing_pending: bool,
+    linked_editing_generation: u64,
     selection_range_history: Vec<Selection>,
     selection_range_last: Option<Selection>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
@@ -111,6 +120,7 @@ pub struct Lsp {
     _code_lens_command_task: Task<Result<()>>,
     _folding_range_task: Task<()>,
     _inlay_hint_task: Task<()>,
+    _linked_editing_task: Task<()>,
     _selection_range_task: Task<()>,
     _semantic_tokens_task: Task<()>,
     pub(super) _code_action_task: Task<()>,
@@ -131,6 +141,7 @@ impl Default for Lsp {
             document_link_provider: None,
             folding_range_provider: None,
             inlay_hint_provider: None,
+            linked_editing_range_provider: None,
             selection_range_provider: None,
             semantic_tokens_provider: None,
             signature_help_provider: None,
@@ -152,6 +163,11 @@ impl Default for Lsp {
             inlay_hint_resolved: vec![],
             inlay_hint_resolve_actions: vec![],
             active_inlay_hint: None,
+            linked_editing_ranges: Vec::new(),
+            linked_editing_word_pattern: None,
+            linked_editing_regex: None,
+            linked_editing_pending: false,
+            linked_editing_generation: 0,
             selection_range_history: Vec::new(),
             selection_range_last: None,
             semantic_tokens: vec![],
@@ -170,6 +186,7 @@ impl Default for Lsp {
             _code_lens_command_task: Task::ready(Ok(())),
             _folding_range_task: Task::ready(()),
             _inlay_hint_task: Task::ready(()),
+            _linked_editing_task: Task::ready(()),
             _selection_range_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
             _code_action_task: Task::ready(()),
@@ -187,6 +204,7 @@ impl Lsp {
         cx: &mut Context<InputState>,
     ) {
         self.invalidate_inlay_hints();
+        self.invalidate_linked_editing_request();
         self.invalidate_code_lenses();
         self.invalidate_document_links();
         self.selection_range_history.clear();
@@ -219,6 +237,7 @@ impl Lsp {
         self.inlay_hint_resolved.clear();
         self.inlay_hint_resolve_actions.clear();
         self.active_inlay_hint = None;
+        self.clear_linked_editing();
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.semantic_tokens.clear();
@@ -237,6 +256,7 @@ impl Lsp {
         self._code_lens_command_task = Task::ready(Ok(()));
         self._folding_range_task = Task::ready(());
         self._inlay_hint_task = Task::ready(());
+        self._linked_editing_task = Task::ready(());
         self._selection_range_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
         self._code_action_task = Task::ready(());

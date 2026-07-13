@@ -319,6 +319,12 @@ impl RenderOnce for Input {
                         this.on_action(
                             window.listener_for(&self.state, InputState::on_action_go_to_bracket),
                         )
+                        .on_action(
+                            window.listener_for(
+                                &self.state,
+                                InputState::on_action_start_linked_editing,
+                            ),
+                        )
                     })
                     .when(state.mode.is_multi_line(), |this| {
                         this.on_action(window.listener_for(&self.state, InputState::indent_inline))

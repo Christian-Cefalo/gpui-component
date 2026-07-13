@@ -800,6 +800,22 @@ impl TextElement {
             .collect()
     }
 
+    fn layout_linked_editing_ranges(
+        &self,
+        ranges: &[Range<usize>],
+        last_layout: &LastLayout,
+        bounds: &Bounds<Pixels>,
+    ) -> Vec<(Path<Pixels>, bool)> {
+        ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| {
+                Self::layout_match_range(range.clone(), last_layout, bounds)
+                    .map(|path| (path, index == 0))
+            })
+            .collect()
+    }
+
     fn layout_bracket_matches(
         &self,
         last_layout: &LastLayout,
@@ -1623,6 +1639,7 @@ pub(super) struct PrepaintState {
     search_match_paths: Vec<(Path<Pixels>, bool)>,
     document_color_paths: Vec<(Path<Pixels>, Hsla)>,
     document_highlight_paths: Vec<(Path<Pixels>, Option<lsp_types::DocumentHighlightKind>)>,
+    linked_editing_paths: Vec<(Path<Pixels>, bool)>,
     hover_definition_hitbox: Option<Hitbox>,
     indent_guides_path: Option<Path<Pixels>>,
     bounds: Bounds<Pixels>,
@@ -2062,6 +2079,7 @@ impl Element for TextElement {
         // Save the unscrolled x before layout_cursor modifies bounds.origin with scroll_offset.
         // Fold icons and their hitboxes must use this value so they stay fixed in the gutter
         // regardless of horizontal scroll position.
+        let linked_editing_ranges = state.linked_editing_byte_ranges().to_vec();
         let input_bounds = bounds;
         let original_x = bounds.origin.x;
 
@@ -2077,6 +2095,8 @@ impl Element for TextElement {
             self.layout_document_colors(&document_colors, &last_layout, &bounds, cx);
         let document_highlight_paths =
             self.layout_document_highlights(&document_highlights, &last_layout, &bounds);
+        let linked_editing_paths =
+            self.layout_linked_editing_ranges(&linked_editing_ranges, &last_layout, &bounds);
 
         let state = self.state.read(cx);
         let line_numbers = if state.mode.line_number() {
@@ -2163,6 +2183,7 @@ impl Element for TextElement {
             hover_definition_hitbox,
             document_color_paths,
             document_highlight_paths,
+            linked_editing_paths,
             indent_guides_path,
             fold_icon_layout,
             code_lens_layout,
@@ -2286,6 +2307,14 @@ impl Element for TextElement {
                         cx.theme().selection.opacity(0.28)
                     }
                     _ => cx.theme().selection.opacity(0.2),
+                };
+                window.paint_path(path.clone(), color);
+            }
+            for (path, primary) in prepaint.linked_editing_paths.iter() {
+                let color = if *primary {
+                    cx.theme().selection.opacity(0.3)
+                } else {
+                    cx.theme().selection.opacity(0.2)
                 };
                 window.paint_path(path.clone(), color);
             }
