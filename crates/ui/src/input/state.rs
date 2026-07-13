@@ -1921,11 +1921,14 @@ impl InputState {
             self.clear_inline_completion(cx);
         }
 
-        // In multi-line mode with `submit_on_enter` enabled, a plain `Enter`
-        // (without Shift) is treated as submit: propagate the action and emit
-        // PressEnter without inserting a newline. `Shift+Enter` still inserts
-        // a newline.
-        let insert_newline = self.mode.is_multi_line() && (!self.submit_on_enter || action.shift);
+        // A secondary Enter (Ctrl/Cmd+Enter) is always a submit action. This
+        // keeps multi-line inputs useful for commit messages, comments, and
+        // similar forms without mutating their value immediately before the
+        // host handles the submit event. With `submit_on_enter`, plain Enter
+        // also submits while Shift+Enter still inserts a newline.
+        let insert_newline = self.mode.is_multi_line()
+            && !action.secondary
+            && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
             if self.has_multiple_selections() {
@@ -3897,6 +3900,45 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    #[gpui::test]
+    fn secondary_enter_submits_multi_line_input_without_inserting_text(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state.auto_grow(1, 5));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("subject", window, cx);
+                state.set_selection_range(
+                    Position::new(0, 7),
+                    Position::new(0, 7),
+                    false,
+                    window,
+                    cx,
+                );
+                state.enter(
+                    &Enter {
+                        secondary: true,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "subject");
+
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "subject\n");
+            });
+        });
     }
 
     fn rust_pair_configuration() -> EditorLanguageConfiguration {
