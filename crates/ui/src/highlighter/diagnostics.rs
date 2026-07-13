@@ -4,13 +4,13 @@ use std::{
     usize,
 };
 
-use gpui::{px, App, HighlightStyle, Hsla, SharedString, UnderlineStyle};
+use gpui::{App, HighlightStyle, Hsla, SharedString, StrikethroughStyle, UnderlineStyle, px};
 use ropey::Rope;
 use sum_tree::{Bias, SeekTarget, SumTree};
 
 use crate::{
-    input::{Position, RopeExt as _},
     ActiveTheme,
+    input::{Position, RopeExt as _},
 };
 
 pub type DiagnosticRelatedInformation = lsp_types::DiagnosticRelatedInformation;
@@ -175,6 +175,24 @@ impl Diagnostic {
         self.source = Some(source.into());
         self
     }
+
+    fn has_tag(&self, tag: DiagnosticTag) -> bool {
+        self.tags.as_ref().is_some_and(|tags| tags.contains(&tag))
+    }
+
+    fn highlight_style(&self, cx: &App) -> HighlightStyle {
+        let mut style = self.severity.highlight_style(cx);
+        if self.has_tag(DiagnosticTag::UNNECESSARY) {
+            style.fade_out = Some(0.5);
+        }
+        if self.has_tag(DiagnosticTag::DEPRECATED) {
+            style.strikethrough = Some(StrikethroughStyle {
+                color: Some(self.severity.fg(cx)),
+                thickness: px(1.),
+            });
+        }
+        style
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -325,7 +343,7 @@ impl DiagnosticSet {
         let mut styles = vec![];
         for entry in self.range(range.clone()) {
             let range = entry.range.clone();
-            styles.push((range, entry.diagnostic.severity.highlight_style(cx)));
+            styles.push((range, entry.diagnostic.highlight_style(cx)));
         }
 
         styles
@@ -391,5 +409,44 @@ mod tests {
 
         diagnostics.clear();
         assert_eq!(diagnostics.len(), 0);
+    }
+
+    #[test]
+    fn lsp_diagnostic_conversion_preserves_rich_metadata_and_tags() {
+        use super::Diagnostic;
+
+        let protocol = lsp_types::Diagnostic {
+            range: lsp_types::Range::new(Position::new(1, 2), Position::new(1, 6)),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            code: Some(lsp_types::NumberOrString::Number(17)),
+            code_description: Some(lsp_types::CodeDescription {
+                href: "https://example.invalid/diagnostics/17".parse().unwrap(),
+            }),
+            source: Some("test-server".to_string()),
+            message: "deprecated value".to_string(),
+            related_information: Some(vec![lsp_types::DiagnosticRelatedInformation {
+                location: lsp_types::Location {
+                    uri: "file:///workspace/related.rs".parse().unwrap(),
+                    range: lsp_types::Range::new(Position::new(3, 1), Position::new(3, 4)),
+                },
+                message: "declared here".to_string(),
+            }]),
+            tags: Some(vec![
+                lsp_types::DiagnosticTag::UNNECESSARY,
+                lsp_types::DiagnosticTag::DEPRECATED,
+            ]),
+            data: Some(serde_json::json!({"opaque": true})),
+        };
+
+        let diagnostic = Diagnostic::from(protocol.clone());
+
+        assert_eq!(diagnostic.range, Position::new(1, 2)..Position::new(1, 6));
+        assert_eq!(diagnostic.code.as_deref(), Some("17"));
+        assert_eq!(diagnostic.code_description, protocol.code_description);
+        assert_eq!(diagnostic.related_information, protocol.related_information);
+        assert_eq!(diagnostic.tags, protocol.tags);
+        assert_eq!(diagnostic.data, protocol.data);
+        assert!(diagnostic.has_tag(lsp_types::DiagnosticTag::UNNECESSARY));
+        assert!(diagnostic.has_tag(lsp_types::DiagnosticTag::DEPRECATED));
     }
 }
