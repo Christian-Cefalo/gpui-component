@@ -18,6 +18,7 @@ mod inlay_hints;
 mod refresh;
 mod selection_ranges;
 mod semantic_tokens;
+mod signature_help;
 
 pub use code_actions::*;
 pub use code_lens::*;
@@ -31,6 +32,7 @@ pub use hover::*;
 pub use inlay_hints::*;
 pub use selection_ranges::*;
 pub use semantic_tokens::*;
+pub use signature_help::*;
 
 /// LSP ServerCapabilities
 ///
@@ -63,6 +65,8 @@ pub struct Lsp {
     pub selection_range_provider: Option<Rc<dyn SelectionRangeProvider>>,
     /// The range semantic tokens provider.
     pub semantic_tokens_provider: Option<Rc<dyn DocumentRangeSemanticTokensProvider>>,
+    /// The parameter-hint provider.
+    pub signature_help_provider: Option<Rc<dyn SignatureHelpProvider>>,
 
     document_colors: Vec<(lsp_types::Range, Hsla)>,
     document_highlights: Vec<lsp_types::DocumentHighlight>,
@@ -83,6 +87,7 @@ pub struct Lsp {
     /// names. Color is resolved from the name at paint time so theme switches
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
+    pub(super) signature_help_generation: u64,
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
@@ -95,6 +100,7 @@ pub struct Lsp {
     _inlay_hint_task: Task<()>,
     _selection_range_task: Task<()>,
     _semantic_tokens_task: Task<()>,
+    pub(super) _signature_help_task: Task<()>,
 }
 
 impl Default for Lsp {
@@ -113,6 +119,7 @@ impl Default for Lsp {
             inlay_hint_provider: None,
             selection_range_provider: None,
             semantic_tokens_provider: None,
+            signature_help_provider: None,
             document_colors: vec![],
             document_highlights: vec![],
             document_links: vec![],
@@ -129,6 +136,7 @@ impl Default for Lsp {
             selection_range_history: Vec::new(),
             selection_range_last: None,
             semantic_tokens: vec![],
+            signature_help_generation: 0,
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
@@ -141,6 +149,7 @@ impl Default for Lsp {
             _inlay_hint_task: Task::ready(()),
             _selection_range_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
+            _signature_help_task: Task::ready(()),
         }
     }
 }
@@ -160,6 +169,7 @@ impl Lsp {
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.folding_ranges.clear();
+        self.cancel_signature_help_request();
         self.update_folding_ranges(text, window, cx);
         self.update_document_colors(text, window, cx);
         self.update_semantic_tokens(text, window, cx);
@@ -183,6 +193,7 @@ impl Lsp {
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.semantic_tokens.clear();
+        self.cancel_signature_help_request();
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
@@ -195,6 +206,7 @@ impl Lsp {
         self._inlay_hint_task = Task::ready(());
         self._selection_range_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
+        self._signature_help_task = Task::ready(());
     }
 }
 

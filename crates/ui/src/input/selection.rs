@@ -20,6 +20,7 @@ impl InputState {
         };
 
         self.selected_range = (range.start..range.end).into();
+        self.close_signature_help(cx);
         self.selected_word_range = Some(self.selected_range);
         self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
@@ -32,6 +33,7 @@ impl InputState {
     pub(super) fn select_line(&mut self, offset: usize, _: &mut Window, cx: &mut Context<Self>) {
         let range = TextSelector::line_range(&self.text, offset);
         self.selected_range = (range.start..range.end).into();
+        self.close_signature_help(cx);
         self.selected_word_range = None;
         self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);

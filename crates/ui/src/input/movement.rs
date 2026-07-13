@@ -53,6 +53,7 @@ impl InputState {
         self.update_preferred_column();
         self.hide_context_menu(cx);
         self.clear_inline_completion(cx);
+        self.retrigger_signature_help_after_cursor_move(cx);
         cx.emit(crate::input::InputEvent::SelectionChange);
         cx.notify()
     }
@@ -160,6 +161,9 @@ impl InputState {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
             return;
         }
+        if self.signature_help_has_multiple(cx) && self.previous_parameter_hint(cx) {
+            return;
+        }
 
         if self.mode.is_single_line() {
             return;
@@ -178,6 +182,9 @@ impl InputState {
 
     pub(super) fn down(&mut self, action: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
         if self.handle_action_for_context_menu(Box::new(action.clone()), window, cx) {
+            return;
+        }
+        if self.signature_help_has_multiple(cx) && self.next_parameter_hint(cx) {
             return;
         }
 

@@ -74,7 +74,15 @@ pub(crate) struct Popover {
     editor: Entity<InputState>,
     range: Range<usize>,
     width_limit: Range<Pixels>,
+    dismiss_behavior: PopoverDismissBehavior,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PopoverDismissBehavior {
+    #[default]
+    Hover,
+    SignatureHelp,
 }
 
 impl Styled for Popover {
@@ -100,8 +108,14 @@ impl Popover {
             range,
             style: StyleRefinement::default(),
             width_limit: px(200.)..px(500.),
+            dismiss_behavior: PopoverDismissBehavior::Hover,
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
         }
+    }
+
+    pub(crate) fn dismiss_signature_help(mut self) -> Self {
+        self.dismiss_behavior = PopoverDismissBehavior::SignatureHelp;
+        self
     }
 
     /// Get the bounds of the range in the editor, if it is visible.
@@ -268,25 +282,31 @@ impl Element for Popover {
         popover.paint(window, cx);
 
         let editor = self.editor.clone();
+        let dismiss_behavior = self.dismiss_behavior;
         // Mouse down out to hide.
         window.on_mouse_event(move |event: &MouseDownEvent, _, _, cx| {
             if !bounds.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.clear_hover_state(cx);
+                let _ = editor.update(cx, |editor, cx| match dismiss_behavior {
+                    PopoverDismissBehavior::Hover => editor.clear_hover_state(cx),
+                    PopoverDismissBehavior::SignatureHelp => {
+                        editor.close_signature_help(cx);
+                    }
                 });
             }
         });
 
         // Mouse out of trigger + popover bounds
-        let editor = self.editor.clone();
-        let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
-        let keep_open_region = trigger_bounds.union(&bounds);
-        window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
-            if !keep_open_region.contains(&event.position) {
-                let _ = editor.update(cx, |editor, cx| {
-                    editor.clear_hover_state(cx);
-                });
-            }
-        })
+        if self.dismiss_behavior == PopoverDismissBehavior::Hover {
+            let editor = self.editor.clone();
+            let trigger_bounds = self.trigger_bounds(cx).unwrap_or(bounds);
+            let keep_open_region = trigger_bounds.union(&bounds);
+            window.on_mouse_event(move |event: &MouseMoveEvent, _, _, cx| {
+                if !keep_open_region.contains(&event.position) {
+                    let _ = editor.update(cx, |editor, cx| {
+                        editor.clear_hover_state(cx);
+                    });
+                }
+            })
+        }
     }
 }

@@ -42,7 +42,7 @@ use crate::input::{
     HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
-    popovers::{ContextMenu, DiagnosticPopover, HoverPopover},
+    popovers::{ContextMenu, DiagnosticPopover, HoverPopover, SignatureHelpPopover},
     search::SearchPanel,
     snippet::SnippetSession,
     snippet_variables::SnippetVariableContext,
@@ -122,6 +122,9 @@ actions!(
         Search,
         GoToDefinition,
         OpenDocumentLink,
+        TriggerParameterHints,
+        PreviousParameterHint,
+        NextParameterHint,
     ]
 );
 
@@ -194,6 +197,12 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
         KeyBinding::new("shift-tab", OutdentInline, Some(CONTEXT)),
         KeyBinding::new("ctrl-space", TriggerCompletion, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-space", TriggerParameterHints, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-space", TriggerParameterHints, Some(CONTEXT)),
+        KeyBinding::new("alt-up", PreviousParameterHint, Some(CONTEXT)),
+        KeyBinding::new("alt-down", NextParameterHint, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -468,6 +477,7 @@ pub struct InputState {
     /// to the active snippet placeholder.
     pub(super) snippet_tracking_suspended: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
+    pub(super) signature_help_popover: Option<Entity<SignatureHelpPopover>>,
     /// The LSP definitions locations for "Go to Definition" feature.
     pub(super) hover_definition: HoverDefinition,
 
@@ -585,6 +595,7 @@ impl InputState {
             snippet_session: None,
             snippet_tracking_suspended: false,
             hover_popover: None,
+            signature_help_popover: None,
             hover_definition: HoverDefinition::default(),
             silent_replace_text: false,
             emit_events: true,
@@ -956,6 +967,7 @@ impl InputState {
         if self.mode.is_code_editor() {
             self._pending_update = true;
             self.lsp.reset();
+            self.signature_help_popover = None;
         }
     }
 
@@ -1342,6 +1354,7 @@ impl InputState {
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = (0..self.text.len()).into();
+        self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
         cx.notify();
@@ -1719,6 +1732,10 @@ impl InputState {
             return; // Consume the escape, don't propagate
         }
 
+        if self.close_signature_help(cx) {
+            return;
+        }
+
         if self.ime_marked_range.is_some() {
             self.unmark_text(window, cx);
         }
@@ -1820,6 +1837,7 @@ impl InputState {
 
         // Clear inline completion on any mouse interaction
         self.clear_inline_completion(cx);
+        self.close_signature_help(cx);
 
         // If there have IME marked range and is empty (Means pressed Esc to abort IME typing)
         // Clear the marked range.
@@ -2304,6 +2322,7 @@ impl InputState {
     /// Ensure the offset use self.next_boundary or self.previous_boundary to get the correct offset.
     pub(crate) fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.clear_inline_completion(cx);
+        self.close_signature_help(cx);
 
         let offset = offset.clamp(0, self.text.len());
         if self.selection_reversed {
@@ -2338,6 +2357,7 @@ impl InputState {
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.cursor();
         self.selected_range = (offset..offset).into();
+        self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
         cx.emit(InputEvent::SelectionChange);
         cx.notify()
@@ -2437,6 +2457,7 @@ impl InputState {
         // Because maybe user want to copy the selected text by AppMenuBar (will take focus handle).
 
         self.hover_popover = None;
+        self.close_signature_help(cx);
         self.diagnostic_popover = None;
         self.context_menu_content = None;
         self.clear_inline_completion(cx);
@@ -3041,6 +3062,7 @@ impl EntityInputHandler for InputState {
             self.update_preferred_column();
         }
         if !self.silent_replace_text {
+            self.handle_signature_help_text_change(cx);
             self.handle_completion_trigger(&new_text, window, cx);
         }
         if self.emit_events {
@@ -3113,6 +3135,7 @@ impl EntityInputHandler for InputState {
 
         self.update_fold_candidates_incremental(&range, new_text);
         self.lsp.update(&self.text, window, cx);
+        self.signature_help_popover = None;
         if new_text.is_empty() {
             // Cancel selection, when cancel IME input.
             self.selected_range = (range.start..range.start).into();
@@ -3263,16 +3286,22 @@ impl Render for InputState {
             .children(self.diagnostic_popover.clone())
             .children(self.context_menu_content.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
+            .children(self.signature_help_popover.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::input::{CodeLensProvider, DocumentLinkProvider};
+    use crate::input::{CodeLensProvider, DocumentLinkProvider, SignatureHelpProvider};
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
-    use lsp_types::{CodeLens, Command, DocumentLink, Position as LspPosition, Range as LspRange};
+    use lsp_types::{
+        CodeLens, Command, DocumentLink, ParameterInformation, ParameterLabel,
+        Position as LspPosition, Range as LspRange, SignatureHelp, SignatureHelpContext,
+        SignatureInformation,
+    };
+    use std::{cell::RefCell, time::Duration};
 
     struct InputView {
         input: Entity<InputState>,
@@ -3316,6 +3345,11 @@ mod tests {
 
     struct StaticDocumentLinkProvider {
         activated: Rc<Cell<bool>>,
+    }
+
+    struct StaticSignatureHelpProvider {
+        calls: Rc<Cell<usize>>,
+        contexts: Rc<RefCell<Vec<SignatureHelpContext>>>,
     }
 
     impl CodeLensProvider for StaticCodeLensProvider {
@@ -3373,6 +3407,51 @@ mod tests {
         }
     }
 
+    impl SignatureHelpProvider for StaticSignatureHelpProvider {
+        fn trigger_characters(&self, _: &App) -> Vec<String> {
+            vec!["(".into()]
+        }
+
+        fn retrigger_characters(&self, _: &App) -> Vec<String> {
+            vec![",".into()]
+        }
+
+        fn signature_help(
+            &self,
+            _text: &Rope,
+            _offset: usize,
+            context: SignatureHelpContext,
+            _cx: &mut Context<InputState>,
+        ) -> Task<anyhow::Result<Option<SignatureHelp>>> {
+            self.calls.set(self.calls.get() + 1);
+            self.contexts.borrow_mut().push(context);
+            Task::ready(Ok(Some(SignatureHelp {
+                signatures: vec![
+                    SignatureInformation {
+                        label: "call(value: i32)".into(),
+                        documentation: None,
+                        parameters: Some(vec![ParameterInformation {
+                            label: ParameterLabel::Simple("value: i32".into()),
+                            documentation: None,
+                        }]),
+                        active_parameter: None,
+                    },
+                    SignatureInformation {
+                        label: "call(value: &str)".into(),
+                        documentation: None,
+                        parameters: Some(vec![ParameterInformation {
+                            label: ParameterLabel::Simple("value: &str".into()),
+                            documentation: None,
+                        }]),
+                        active_parameter: None,
+                    },
+                ],
+                active_signature: Some(0),
+                active_parameter: Some(0),
+            })))
+        }
+    }
+
     #[gpui::test]
     fn document_links_refresh_activate_and_invalidate_with_editor_text(cx: &mut TestAppContext) {
         let input_view = InputView::new(cx);
@@ -3407,6 +3486,73 @@ mod tests {
                 assert!(!state.has_document_link_at_cursor());
             });
         });
+    }
+
+    #[gpui::test]
+    fn signature_help_triggers_navigates_and_cancels_stale_requests(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let calls = Rc::new(Cell::new(0));
+        let contexts = Rc::new(RefCell::new(Vec::new()));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("call", window, cx);
+                state.lsp.signature_help_provider = Some(Rc::new(StaticSignatureHelpProvider {
+                    calls: calls.clone(),
+                    contexts: contexts.clone(),
+                }));
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.move_to(4, None, cx);
+                state.replace_text_in_range(None, "(", window, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(121));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
+                let help = state.signature_help(cx).expect("signature help");
+                assert_eq!(help.signatures.len(), 2);
+                assert_eq!(help.active_signature, Some(0));
+                assert!(state.next_parameter_hint(cx));
+                assert_eq!(state.signature_help(cx).unwrap().active_signature, Some(1));
+                assert!(state.next_parameter_hint(cx));
+                assert!(state.signature_help(cx).is_none());
+            });
+        });
+        assert_eq!(calls.get(), 1);
+        let contexts = contexts.borrow();
+        assert_eq!(
+            contexts[0].trigger_kind,
+            lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER
+        );
+        assert_eq!(contexts[0].trigger_character.as_deref(), Some("("));
+        drop(contexts);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_text_in_range(None, "(", window, cx);
+                state.replace_text_in_range(None, "x", window, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(121));
+        cx.run_until_parked();
+        cx.update(|_, cx| {
+            input.read_with(cx, |state, cx| {
+                assert!(state.signature_help(cx).is_none());
+            });
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "superseded delayed request must not dispatch"
+        );
     }
 
     #[gpui::test]
