@@ -2544,6 +2544,7 @@ impl InputState {
 
         self.hover_popover = None;
         self.close_signature_help(cx);
+        self.lsp.invalidate_automatic_code_actions();
         self.diagnostic_popover = None;
         self.context_menu_content = None;
         self.clear_inline_completion(cx);
@@ -3532,6 +3533,7 @@ impl Render for InputState {
             .overflow_x_hidden()
             .child(TextElement::new(cx.entity().clone()).placeholder(self.placeholder.clone()))
             .children(self.diagnostic_popover.clone())
+            .children(self.render_automatic_code_action_indicator(cx))
             .children(self.context_menu_content.as_ref().map(|menu| menu.render()))
             .children(self.hover_popover.clone())
             .children(self.signature_help_popover.clone())
@@ -3542,15 +3544,16 @@ impl Render for InputState {
 mod tests {
     use super::*;
     use crate::input::{
-        CodeLensProvider, DocumentLinkProvider, EditorAutoClosingPair, EditorLanguageConfiguration,
-        EditorTokenContext, SignatureHelpProvider,
+        CodeActionProvider, CodeActionTrigger, CodeLensProvider, DocumentLinkProvider,
+        EditorAutoClosingPair, EditorLanguageConfiguration, EditorTokenContext,
+        SignatureHelpProvider,
     };
     use crate::theme::Theme;
     use gpui::{TestAppContext, VisualTestContext};
     use lsp_types::{
-        CodeLens, Command, DocumentLink, ParameterInformation, ParameterLabel,
-        Position as LspPosition, Range as LspRange, SignatureHelp, SignatureHelpContext,
-        SignatureInformation,
+        CodeAction, CodeActionKind, CodeLens, Command, DocumentLink, ParameterInformation,
+        ParameterLabel, Position as LspPosition, Range as LspRange, SignatureHelp,
+        SignatureHelpContext, SignatureInformation,
     };
     use std::{cell::RefCell, time::Duration};
 
@@ -3616,6 +3619,43 @@ mod tests {
     struct StaticSignatureHelpProvider {
         calls: Rc<Cell<usize>>,
         contexts: Rc<RefCell<Vec<SignatureHelpContext>>>,
+    }
+
+    struct StaticCodeActionProvider {
+        triggers: Rc<RefCell<Vec<CodeActionTrigger>>>,
+    }
+
+    impl CodeActionProvider for StaticCodeActionProvider {
+        fn id(&self) -> SharedString {
+            "static-code-actions".into()
+        }
+
+        fn code_actions(
+            &self,
+            _state: Entity<InputState>,
+            _range: std::ops::Range<usize>,
+            trigger: CodeActionTrigger,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Vec<CodeAction>>> {
+            self.triggers.borrow_mut().push(trigger);
+            Task::ready(Ok(vec![CodeAction {
+                title: "Apply quick fix".to_string(),
+                kind: Some(CodeActionKind::QUICKFIX),
+                ..CodeAction::default()
+            }]))
+        }
+
+        fn perform_code_action(
+            &self,
+            _state: Entity<InputState>,
+            _action: CodeAction,
+            _push_to_history: bool,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<()>> {
+            Task::ready(Ok(()))
+        }
     }
 
     impl CodeLensProvider for StaticCodeLensProvider {
@@ -3751,6 +3791,88 @@ mod tests {
                 assert!(state.document_links().is_empty());
                 assert!(!state.has_document_link_at_cursor());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn automatic_code_actions_debounce_retrigger_and_preserve_manual_invocation(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let triggers = Rc::new(RefCell::new(Vec::new()));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("let value = missing;", window, cx);
+                state.lsp.code_action_providers = vec![Rc::new(StaticCodeActionProvider {
+                    triggers: triggers.clone(),
+                })];
+                state.focus(window, cx);
+                state.refresh_automatic_code_actions(window, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(249));
+        cx.run_until_parked();
+        assert!(triggers.borrow().is_empty());
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.automatic_code_actions().len(), 1);
+            assert_eq!(state.automatic_code_action_range(), Some(0..0));
+        });
+        assert_eq!(triggers.borrow().as_slice(), [CodeActionTrigger::Automatic]);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.move_to(4, None, cx);
+                state.refresh_automatic_code_actions(window, cx);
+                state.move_to(8, None, cx);
+                state.refresh_automatic_code_actions(window, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert_eq!(
+            triggers.borrow().as_slice(),
+            [CodeActionTrigger::Automatic, CodeActionTrigger::Automatic],
+            "the superseded cursor request must be cancelled before dispatch"
+        );
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.automatic_code_action_range(), Some(8..8));
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.move_to(10, None, cx);
+                state.refresh_automatic_code_actions(window, cx);
+                let replacement_focus = cx.focus_handle();
+                window.focus(&replacement_focus, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(250));
+        cx.run_until_parked();
+        assert_eq!(
+            triggers.borrow().as_slice(),
+            [CodeActionTrigger::Automatic, CodeActionTrigger::Automatic],
+            "losing focus must cancel a pending automatic request"
+        );
+        input.read_with(&cx, |state, _| {
+            assert!(state.automatic_code_action_range().is_none());
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.focus(window, cx);
+                state.handle_code_action_trigger(window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(triggers.borrow().last(), Some(&CodeActionTrigger::Invoked));
+        input.read_with(&cx, |state, cx| {
+            assert!(state.is_context_menu_open(cx));
         });
     }
 

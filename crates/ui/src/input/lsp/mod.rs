@@ -1,9 +1,13 @@
 use anyhow::Result;
 use gpui::{App, Context, Hsla, MouseMoveEvent, SharedString, Task, Window};
 use ropey::Rope;
+use std::ops::Range as ByteRange;
 use std::rc::Rc;
 
-use crate::input::{InputState, RopeExt, Selection, popovers::ContextMenu};
+use crate::input::{
+    InputState, RopeExt, Selection,
+    popovers::{CodeActionItem, ContextMenu},
+};
 
 mod code_actions;
 mod code_lens;
@@ -88,6 +92,10 @@ pub struct Lsp {
     /// take effect without a refetch.
     semantic_tokens: Vec<(lsp_types::Range, SharedString)>,
     pub(super) signature_help_generation: u64,
+    automatic_code_actions: Vec<CodeActionItem>,
+    automatic_code_action_range: Option<ByteRange<usize>>,
+    automatic_code_action_requested_range: Option<ByteRange<usize>>,
+    code_action_generation: u64,
     _hover_task: Task<Result<()>>,
     _document_color_task: Task<()>,
     _document_highlight_task: Task<()>,
@@ -100,6 +108,7 @@ pub struct Lsp {
     _inlay_hint_task: Task<()>,
     _selection_range_task: Task<()>,
     _semantic_tokens_task: Task<()>,
+    pub(super) _code_action_task: Task<()>,
     pub(super) _signature_help_task: Task<()>,
 }
 
@@ -137,6 +146,10 @@ impl Default for Lsp {
             selection_range_last: None,
             semantic_tokens: vec![],
             signature_help_generation: 0,
+            automatic_code_actions: Vec::new(),
+            automatic_code_action_range: None,
+            automatic_code_action_requested_range: None,
+            code_action_generation: 0,
             _hover_task: Task::ready(Ok(())),
             _document_color_task: Task::ready(()),
             _document_highlight_task: Task::ready(()),
@@ -149,6 +162,7 @@ impl Default for Lsp {
             _inlay_hint_task: Task::ready(()),
             _selection_range_task: Task::ready(()),
             _semantic_tokens_task: Task::ready(()),
+            _code_action_task: Task::ready(()),
             _signature_help_task: Task::ready(()),
         }
     }
@@ -170,6 +184,7 @@ impl Lsp {
         self.selection_range_last = None;
         self.folding_ranges.clear();
         self.cancel_signature_help_request();
+        self.invalidate_automatic_code_actions();
         self.update_folding_ranges(text, window, cx);
         self.update_document_colors(text, window, cx);
         self.update_semantic_tokens(text, window, cx);
@@ -194,6 +209,10 @@ impl Lsp {
         self.selection_range_last = None;
         self.semantic_tokens.clear();
         self.cancel_signature_help_request();
+        self.automatic_code_actions.clear();
+        self.automatic_code_action_range = None;
+        self.automatic_code_action_requested_range = None;
+        self.code_action_generation = self.code_action_generation.wrapping_add(1);
         self._hover_task = Task::ready(Ok(()));
         self._document_color_task = Task::ready(());
         self._document_highlight_task = Task::ready(());
@@ -206,6 +225,7 @@ impl Lsp {
         self._inlay_hint_task = Task::ready(());
         self._selection_range_task = Task::ready(());
         self._semantic_tokens_task = Task::ready(());
+        self._code_action_task = Task::ready(());
         self._signature_help_task = Task::ready(());
     }
 }

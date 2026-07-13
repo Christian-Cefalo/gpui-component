@@ -15,8 +15,9 @@ use gpui_component::{
     h_flex,
     highlighter::{Diagnostic, DiagnosticSeverity, Language, LanguageConfig, LanguageRegistry},
     input::{
-        self, CodeActionProvider, CompletionProvider, DefinitionProvider, DocumentColorProvider,
-        HoverProvider, Input, InputEvent, InputState, Position, Rope, RopeExt, TabSize,
+        self, CodeActionProvider, CodeActionTrigger, CompletionProvider, DefinitionProvider,
+        DocumentColorProvider, HoverProvider, Input, InputEvent, InputState, Position, Rope,
+        RopeExt, TabSize,
     },
     list::ListItem,
     resizable::{h_resizable, resizable_panel},
@@ -273,6 +274,7 @@ impl CodeActionProvider for ExampleLspStore {
         &self,
         _state: Entity<InputState>,
         range: Range<usize>,
+        _trigger: CodeActionTrigger,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Task<Result<Vec<CodeAction>>> {
@@ -442,6 +444,7 @@ impl CodeActionProvider for TextConvertor {
         &self,
         state: Entity<InputState>,
         range: Range<usize>,
+        _trigger: CodeActionTrigger,
         _window: &mut Window,
         cx: &mut App,
     ) -> Task<Result<Vec<CodeAction>>> {

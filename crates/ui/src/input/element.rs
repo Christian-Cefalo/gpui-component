@@ -2494,6 +2494,7 @@ impl Element for TextElement {
             state.refresh_inlay_hints(visible_rows, window, cx);
             state.refresh_code_lenses(prepaint.last_layout.visible_range.clone(), window, cx);
             state.refresh_document_links(window, cx);
+            state.refresh_automatic_code_actions(window, cx);
 
             cx.notify();
         });
