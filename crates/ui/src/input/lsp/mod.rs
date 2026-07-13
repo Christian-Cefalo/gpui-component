@@ -85,6 +85,11 @@ pub struct Lsp {
     pub(super) folding_ranges: Vec<crate::input::display_map::FoldRange>,
     inlay_hints: Vec<lsp_types::InlayHint>,
     inlay_hint_range: Option<lsp_types::Range>,
+    inlay_hint_generation: u64,
+    inlay_hint_resolve_attempted: Vec<bool>,
+    inlay_hint_resolved: Vec<bool>,
+    inlay_hint_resolve_actions: Vec<Option<inlay_hints::PendingInlayHintAction>>,
+    active_inlay_hint: Option<InlayHintIdentity>,
     selection_range_history: Vec<Selection>,
     selection_range_last: Option<Selection>,
     /// Cached semantic tokens as absolute position ranges + theme token-type
@@ -142,6 +147,11 @@ impl Default for Lsp {
             folding_ranges: Vec::new(),
             inlay_hints: vec![],
             inlay_hint_range: None,
+            inlay_hint_generation: 0,
+            inlay_hint_resolve_attempted: vec![],
+            inlay_hint_resolved: vec![],
+            inlay_hint_resolve_actions: vec![],
+            active_inlay_hint: None,
             selection_range_history: Vec::new(),
             selection_range_last: None,
             semantic_tokens: vec![],
@@ -176,8 +186,7 @@ impl Lsp {
         window: &mut Window,
         cx: &mut Context<InputState>,
     ) {
-        self.inlay_hint_range = None;
-        self.inlay_hints.clear();
+        self.invalidate_inlay_hints();
         self.invalidate_code_lenses();
         self.invalidate_document_links();
         self.selection_range_history.clear();
@@ -205,6 +214,11 @@ impl Lsp {
         self.folding_ranges.clear();
         self.inlay_hints.clear();
         self.inlay_hint_range = None;
+        self.inlay_hint_generation = self.inlay_hint_generation.wrapping_add(1);
+        self.inlay_hint_resolve_attempted.clear();
+        self.inlay_hint_resolved.clear();
+        self.inlay_hint_resolve_actions.clear();
+        self.active_inlay_hint = None;
         self.selection_range_history.clear();
         self.selection_range_last = None;
         self.semantic_tokens.clear();
@@ -345,6 +359,7 @@ impl InputState {
     pub(crate) fn clear_hover_state(&mut self, cx: &mut Context<InputState>) {
         self.hover_definition.clear();
         self.clear_active_document_link();
+        self.clear_active_inlay_hint();
         self.hover_popover = None;
         self.lsp._hover_task = Task::ready(Ok(()));
         cx.notify();

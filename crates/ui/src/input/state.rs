@@ -1958,6 +1958,13 @@ impl InputState {
             }
         }
 
+        if let Some(identity) = self.inlay_hint_for_mouse_position(event.position)
+            && self.handle_click_inlay_hint(event, identity, window, cx)
+        {
+            self.selecting = false;
+            return;
+        }
+
         self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
 
@@ -2027,6 +2034,15 @@ impl InputState {
             // Clear hover when mouse leaves the input
             self.clear_hover_state(cx);
             return;
+        }
+
+        if let Some(identity) = self.inlay_hint_for_mouse_position(event.position) {
+            self.clear_hover_state(cx);
+            self.handle_inlay_hint_mouse_move(identity, event, window, cx);
+            return;
+        }
+        if self.clear_active_inlay_hint() {
+            cx.notify();
         }
 
         // Show diagnostic popover on mouse move

@@ -302,6 +302,22 @@ impl InputState {
         true
     }
 
+    /// Activate a cached document link by its stable document-order index.
+    /// This is the semantic equivalent of modifier-click and is used by debug
+    /// automation without moving the caret first.
+    pub fn open_document_link_at(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(link) = self.lsp.document_links.get(index).cloned() else {
+            return false;
+        };
+        self.activate_document_link(link, window, cx);
+        true
+    }
+
     pub(crate) fn on_action_open_document_link(
         &mut self,
         _: &OpenDocumentLink,

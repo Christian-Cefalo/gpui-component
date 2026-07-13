@@ -19,7 +19,7 @@ use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{
-        DisplayInlayHint, RopeExt as _,
+        DisplayInlayHint, DisplayInlayHintPart, RopeExt as _,
         blink_cursor::CURSOR_WIDTH,
         display_map::{InjectedTextSpan, LineLayout, VisualLineMapping},
     },
@@ -2586,7 +2586,13 @@ fn inject_inlay_hints(
         source.len()
             + relevant
                 .iter()
-                .map(|hint| hint.label.len() + 6)
+                .map(|hint| {
+                    hint.parts
+                        .iter()
+                        .map(|part| part.label.len())
+                        .sum::<usize>()
+                        + 6
+                })
                 .sum::<usize>(),
     );
     let mut display_runs = Vec::new();
@@ -2603,29 +2609,61 @@ fn inject_inlay_hints(
             display_runs.extend(runs_for_range(line_runs, 0, &(source_cursor..anchor)));
         }
 
-        let mut label = String::new();
         if hint.padding_left {
-            label.push('\u{2009}');
+            let display_start = display.len();
+            display.push('\u{2009}');
+            display_runs.push(TextRun {
+                len: '\u{2009}'.len_utf8(),
+                font: text_style.font(),
+                color: foreground,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            injections.push(InjectedTextSpan {
+                buffer_offset: anchor,
+                display_range: display_start..display.len(),
+                inlay_hint: None,
+            });
         }
-        label.push_str(&hint.label);
+        for part in &hint.parts {
+            let display_start = display.len();
+            display.push_str(&part.label);
+            let display_end = display.len();
+            display_runs.push(TextRun {
+                len: part.label.len(),
+                font: text_style.font(),
+                color: foreground,
+                background_color: Some(background),
+                underline: part.active.then_some(UnderlineStyle {
+                    thickness: px(1.),
+                    ..UnderlineStyle::default()
+                }),
+                strikethrough: None,
+            });
+            injections.push(InjectedTextSpan {
+                buffer_offset: anchor,
+                display_range: display_start..display_end,
+                inlay_hint: Some((hint.hint_index, part.part_index)),
+            });
+        }
         if hint.padding_right {
-            label.push('\u{2009}');
+            let display_start = display.len();
+            display.push('\u{2009}');
+            display_runs.push(TextRun {
+                len: '\u{2009}'.len_utf8(),
+                font: text_style.font(),
+                color: foreground,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+            injections.push(InjectedTextSpan {
+                buffer_offset: anchor,
+                display_range: display_start..display.len(),
+                inlay_hint: None,
+            });
         }
-        let display_start = display.len();
-        display.push_str(&label);
-        let display_end = display.len();
-        display_runs.push(TextRun {
-            len: label.len(),
-            font: text_style.font(),
-            color: foreground,
-            background_color: Some(background),
-            underline: None,
-            strikethrough: None,
-        });
-        injections.push(InjectedTextSpan {
-            buffer_offset: anchor,
-            display_range: display_start..display_end,
-        });
         source_cursor = anchor;
     }
 
@@ -2765,8 +2803,14 @@ mod tests {
             strikethrough: None,
         };
         let hints = vec![DisplayInlayHint {
+            hint_index: 4,
             buffer_offset: 3,
-            label: ": i32".to_string(),
+            parts: vec![DisplayInlayHintPart {
+                part_index: 2,
+                label: ": i32".to_string(),
+                interactive: true,
+                active: true,
+            }],
             kind: Some(lsp_types::InlayHintKind::TYPE),
             padding_left: true,
             padding_right: false,
@@ -2786,7 +2830,9 @@ mod tests {
 
         assert_eq!(display.as_ref(), "abc\u{2009}: i32 def");
         assert_eq!(mapping.buffer_len, 7);
-        assert_eq!(mapping.injections.len(), 1);
+        assert_eq!(mapping.injections.len(), 2);
+        assert_eq!(mapping.injections[1].inlay_hint, Some((4, 2)));
+        assert!(runs.iter().any(|run| run.underline.is_some()));
         assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), display.len());
     }
 

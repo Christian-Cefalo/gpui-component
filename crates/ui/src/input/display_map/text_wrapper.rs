@@ -362,6 +362,8 @@ pub(crate) struct InjectedTextSpan {
     pub(crate) buffer_offset: usize,
     /// Byte range occupied by the injected text in the shaped display text.
     pub(crate) display_range: Range<usize>,
+    /// Optional semantic identity for an interactive inlay-hint label part.
+    pub(crate) inlay_hint: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -626,6 +628,32 @@ impl LineLayout {
             line_top = line_bottom;
         }
 
+        None
+    }
+
+    /// Returns the inlay-hint and label-part indexes under an exact display
+    /// position. Injected text still maps to its authoritative buffer anchor
+    /// for caret placement; this parallel lookup preserves interaction
+    /// identity without making injected text editable.
+    pub(crate) fn inlay_hint_for_position(
+        &self,
+        pos: Point<Pixels>,
+        last_layout: &LastLayout,
+    ) -> Option<(usize, usize)> {
+        let mut line_top = px(0.);
+        let x_offset = last_layout.alignment_offset(self.longest_width);
+        for (line, mapping) in self.wrapped_lines.iter().zip(self.visual_mappings.iter()) {
+            let line_bottom = line_top + last_layout.line_height;
+            if pos.y >= line_top && pos.y < line_bottom {
+                let display_offset = line.index_for_x(pos.x - x_offset)?;
+                return mapping
+                    .injections
+                    .iter()
+                    .find(|injection| injection.display_range.contains(&display_offset))
+                    .and_then(|injection| injection.inlay_hint);
+            }
+            line_top = line_bottom;
+        }
         None
     }
 
@@ -897,10 +925,12 @@ mod tests {
                 InjectedTextSpan {
                     buffer_offset: 3,
                     display_range: 3..7,
+                    inlay_hint: None,
                 },
                 InjectedTextSpan {
                     buffer_offset: 8,
                     display_range: 12..15,
+                    inlay_hint: None,
                 },
             ],
         };
