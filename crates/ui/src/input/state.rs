@@ -1395,6 +1395,29 @@ impl InputState {
         self.focus(window, cx);
     }
 
+    /// Select a scalar-position range and reveal its active end.
+    ///
+    /// This is intended for trusted editor navigation such as an LSP location
+    /// after the host has converted protocol UTF-16 positions into this
+    /// editor's scalar coordinate model.
+    pub fn set_selection_range(
+        &mut self,
+        start: impl Into<Position>,
+        end: impl Into<Position>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let start = self.text.position_to_offset(&start.into());
+        let end = self.text.position_to_offset(&end.into());
+        self.selection_reversed = false;
+        self.selected_word_range = None;
+        self.move_to(start, None, cx);
+        self.select_to(end, cx);
+        self.scroll_to(end, None, cx);
+        self.update_preferred_column();
+        self.focus(window, cx);
+    }
+
     /// Focus the input field.
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
@@ -3791,6 +3814,28 @@ mod tests {
                 assert!(state.document_links().is_empty());
                 assert!(!state.has_document_link_at_cursor());
             });
+        });
+    }
+
+    #[gpui::test]
+    fn public_selection_navigation_uses_scalar_positions_and_reveals_the_end(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha\nbeta\n", window, cx);
+                state.set_selection_range(Position::new(0, 2), Position::new(1, 2), window, cx);
+            });
+        });
+
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.selected_range(), 2..8);
+            assert_eq!(state.selected_value().as_ref(), "pha\nbe");
+            assert_eq!(state.cursor_position(), Position::new(1, 2));
         });
     }
 
