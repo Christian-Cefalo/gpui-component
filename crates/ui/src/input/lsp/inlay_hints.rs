@@ -66,6 +66,13 @@ pub struct InlayHintIdentity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InlayHintResolutionState {
+    Unresolved,
+    Resolving,
+    Resolved,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingInlayHintAction {
     Hover(InlayHintIdentity),
     Activate(InlayHintIdentity),
@@ -284,6 +291,36 @@ impl Lsp {
         &self.inlay_hints
     }
 
+    fn inlay_hint_resolution_state(&self, hint_index: usize) -> Option<InlayHintResolutionState> {
+        self.inlay_hints.get(hint_index)?;
+        if self
+            .inlay_hint_resolved
+            .get(hint_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            Some(InlayHintResolutionState::Resolved)
+        } else if self
+            .inlay_hint_resolve_attempted
+            .get(hint_index)
+            .copied()
+            .unwrap_or(false)
+        {
+            Some(InlayHintResolutionState::Resolving)
+        } else {
+            Some(InlayHintResolutionState::Unresolved)
+        }
+    }
+
+    fn has_inlay_hint_part(&self, hint_index: usize, part_index: usize) -> bool {
+        self.inlay_hints
+            .get(hint_index)
+            .is_some_and(|hint| match &hint.label {
+                InlayHintLabel::String(_) => part_index == 0,
+                InlayHintLabel::LabelParts(parts) => parts.get(part_index).is_some(),
+            })
+    }
+
     pub(crate) fn invalidate_inlay_hints(&mut self) {
         self.inlay_hint_generation = self.inlay_hint_generation.wrapping_add(1);
         self.inlay_hint_range = None;
@@ -377,6 +414,13 @@ impl InputState {
 
     pub fn active_inlay_hint(&self) -> Option<InlayHintIdentity> {
         self.lsp.active_inlay_hint
+    }
+
+    pub fn inlay_hint_resolution_state(
+        &self,
+        hint_index: usize,
+    ) -> Option<InlayHintResolutionState> {
+        self.lsp.inlay_hint_resolution_state(hint_index)
     }
 
     pub(crate) fn inlay_hint_for_mouse_position(
@@ -593,6 +637,9 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !self.lsp.has_inlay_hint_part(hint_index, part_index) {
+            return false;
+        }
         let identity = InlayHintIdentity {
             hint_index,
             part_index,
@@ -600,6 +647,30 @@ impl InputState {
         self.resolve_or_perform_inlay_hint_action(
             hint_index,
             PendingInlayHintAction::Activate(identity),
+            window,
+            cx,
+        )
+    }
+
+    /// Trigger the same safe hover/resolve path as pointer movement without
+    /// activating a location, command, or text edit.
+    pub fn hover_inlay_hint_at(
+        &mut self,
+        hint_index: usize,
+        part_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.lsp.has_inlay_hint_part(hint_index, part_index) {
+            return false;
+        }
+        let identity = InlayHintIdentity {
+            hint_index,
+            part_index,
+        };
+        self.resolve_or_perform_inlay_hint_action(
+            hint_index,
+            PendingInlayHintAction::Hover(identity),
             window,
             cx,
         )
@@ -815,5 +886,41 @@ mod tests {
             },
         ];
         assert!(normalized_inlay_hint_text_edits(&text, &overlapping).is_none());
+    }
+
+    #[test]
+    fn inlay_hint_resolution_state_distinguishes_pending_and_completed_work() {
+        let mut lsp = Lsp::default();
+        lsp.inlay_hints = vec![InlayHint {
+            position: Position::new(0, 0),
+            label: InlayHintLabel::String(": i32".to_string()),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: None,
+            padding_right: None,
+            data: Some(serde_json::json!({ "id": 1 })),
+        }];
+        lsp.inlay_hint_resolve_attempted = vec![false];
+        lsp.inlay_hint_resolved = vec![false];
+        assert_eq!(
+            lsp.inlay_hint_resolution_state(0),
+            Some(InlayHintResolutionState::Unresolved)
+        );
+
+        lsp.inlay_hint_resolve_attempted[0] = true;
+        assert_eq!(
+            lsp.inlay_hint_resolution_state(0),
+            Some(InlayHintResolutionState::Resolving)
+        );
+
+        lsp.inlay_hint_resolved[0] = true;
+        assert_eq!(
+            lsp.inlay_hint_resolution_state(0),
+            Some(InlayHintResolutionState::Resolved)
+        );
+        assert_eq!(lsp.inlay_hint_resolution_state(1), None);
+        assert!(lsp.has_inlay_hint_part(0, 0));
+        assert!(!lsp.has_inlay_hint_part(0, 1));
     }
 }
