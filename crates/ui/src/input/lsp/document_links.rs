@@ -405,4 +405,18 @@ mod tests {
         let normalized = normalize_document_links(&text, candidates);
         assert_eq!(normalized, vec![link(0, 5, None)]);
     }
+
+    #[test]
+    fn active_link_identity_changes_when_pointer_moves_between_links() {
+        let text = Rope::from_str("alpha beta gamma\n");
+        let mut lsp = Lsp::default();
+        lsp.document_links = vec![link(0, 5, None), link(6, 10, None)];
+
+        assert!(lsp.set_active_document_link_at(&text, 1));
+        assert!(!lsp.set_active_document_link_at(&text, 2));
+        assert!(lsp.set_active_document_link_at(&text, 7));
+        assert_eq!(lsp.active_document_link, Some(link(6, 10, None)));
+        assert!(lsp.clear_active_document_link());
+        assert!(!lsp.clear_active_document_link());
+    }
 }

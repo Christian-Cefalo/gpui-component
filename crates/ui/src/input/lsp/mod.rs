@@ -282,7 +282,7 @@ impl InputState {
         cx: &mut Context<InputState>,
     ) {
         let had_definition = !self.hover_definition.is_empty();
-        let had_document_link = self.lsp.active_document_link.is_some();
+        let previous_document_link = self.lsp.active_document_link.clone();
         let had_popover = self.hover_popover.is_some();
 
         if event.modifiers.secondary() {
@@ -298,7 +298,7 @@ impl InputState {
         }
 
         let changed = had_definition == self.hover_definition.is_empty()
-            || had_document_link != self.lsp.active_document_link.is_some()
+            || previous_document_link != self.lsp.active_document_link
             || had_popover != self.hover_popover.is_some();
         if changed {
             cx.notify();
