@@ -186,90 +186,190 @@ fn append_copy(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SnippetSession {
+struct SnippetInstance {
     tabstops: Vec<SnippetTabstop>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SnippetSession {
+    instances: Vec<SnippetInstance>,
     active: usize,
 }
 
 impl SnippetSession {
     pub(crate) fn new(parsed: &ParsedSnippet, insertion_start: usize) -> Option<Self> {
-        let tabstops = parsed
-            .tabstops
-            .iter()
-            .map(|tabstop| SnippetTabstop {
-                index: tabstop.index,
-                ranges: tabstop
-                    .ranges
+        Self::new_many(parsed, [insertion_start])
+    }
+
+    pub(crate) fn new_many(
+        parsed: &ParsedSnippet,
+        insertion_starts: impl IntoIterator<Item = usize>,
+    ) -> Option<Self> {
+        if parsed.tabstops.is_empty() {
+            return None;
+        }
+        let instances = insertion_starts
+            .into_iter()
+            .map(|insertion_start| SnippetInstance {
+                tabstops: parsed
+                    .tabstops
                     .iter()
-                    .map(|range| insertion_start + range.start..insertion_start + range.end)
+                    .map(|tabstop| SnippetTabstop {
+                        index: tabstop.index,
+                        ranges: tabstop
+                            .ranges
+                            .iter()
+                            .map(|range| insertion_start + range.start..insertion_start + range.end)
+                            .collect(),
+                        transforms: tabstop.transforms.clone(),
+                        choices: tabstop.choices.clone(),
+                    })
                     .collect(),
-                transforms: tabstop.transforms.clone(),
-                choices: tabstop.choices.clone(),
             })
             .collect::<Vec<_>>();
-        (!tabstops.is_empty()).then_some(Self {
-            tabstops,
+        (!instances.is_empty()).then_some(Self {
+            instances,
             active: 0,
         })
     }
 
+    fn active_tabstop(&self, instance: usize) -> Option<&SnippetTabstop> {
+        self.instances
+            .get(instance)
+            .and_then(|instance| instance.tabstops.get(self.active))
+    }
+
+    pub(crate) fn active_ranges(&self) -> Vec<Range<usize>> {
+        (0..self.instances.len())
+            .filter_map(|instance| {
+                self.active_tabstop(instance)
+                    .and_then(|tabstop| tabstop.ranges.first())
+                    .cloned()
+            })
+            .collect()
+    }
+
     pub(crate) fn active_range(&self) -> Option<Range<usize>> {
-        self.tabstops
-            .get(self.active)
+        self.active_tabstop(0)
             .and_then(|tabstop| tabstop.ranges.first())
             .cloned()
     }
 
     pub(crate) fn active_mirrors(&self) -> &[Range<usize>] {
-        self.tabstops
-            .get(self.active)
+        self.active_tabstop(0)
             .and_then(|tabstop| tabstop.ranges.get(1..))
             .unwrap_or_default()
     }
 
     pub(crate) fn active_choices(&self) -> Option<&[String]> {
-        self.tabstops
-            .get(self.active)
+        self.active_tabstop(0)
             .and_then(|tabstop| tabstop.choices.first())
             .and_then(Option::as_deref)
     }
 
     pub(crate) fn active_mirror_replacements(&self, value: &str) -> Vec<(Range<usize>, String)> {
-        let Some(tabstop) = self.tabstops.get(self.active) else {
+        self.active_mirror_replacements_for_values(&[value.to_string()])
+    }
+
+    pub(crate) fn active_mirror_replacements_for_values(
+        &self,
+        values: &[String],
+    ) -> Vec<(Range<usize>, String)> {
+        if values.len() != self.instances.len() {
             return Vec::new();
-        };
-        tabstop
-            .ranges
+        }
+        self.instances
             .iter()
-            .skip(1)
-            .cloned()
-            .zip(tabstop.transforms.iter().skip(1))
-            .map(|(range, transform)| {
-                let replacement = transform
-                    .as_ref()
-                    .map(|transform| transform.apply(value))
-                    .unwrap_or_else(|| value.to_string());
-                (range, replacement)
+            .zip(values)
+            .filter_map(|(instance, value)| {
+                instance
+                    .tabstops
+                    .get(self.active)
+                    .map(|tabstop| (tabstop, value))
+            })
+            .flat_map(|(tabstop, value)| {
+                tabstop
+                    .ranges
+                    .iter()
+                    .skip(1)
+                    .cloned()
+                    .zip(tabstop.transforms.iter().skip(1))
+                    .map(move |(range, transform)| {
+                        let replacement = transform
+                            .as_ref()
+                            .map(|transform| transform.apply(value))
+                            .unwrap_or_else(|| value.clone());
+                        (range, replacement)
+                    })
             })
             .collect()
     }
 
     pub(crate) fn active_is_final(&self) -> bool {
-        self.tabstops
-            .get(self.active)
+        self.active_tabstop(0)
             .is_some_and(|tabstop| tabstop.index == 0)
     }
 
+    pub(crate) fn active_tabstop_index(&self) -> Option<u32> {
+        self.active_tabstop(0).map(|tabstop| tabstop.index)
+    }
+
+    pub(crate) fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     pub(crate) fn contains_selection(&self, selection: Range<usize>) -> bool {
-        self.tabstops
+        self.instances
             .iter()
+            .flat_map(|instance| &instance.tabstops)
             .filter(|tabstop| tabstop.index != 0)
-            .flat_map(|tabstop| &tabstop.ranges)
+            .flat_map(|tabstop| tabstop.ranges.iter())
             .any(|range| range.start <= selection.start && selection.end <= range.end)
     }
 
+    pub(crate) fn contains_selections(&self, selections: &[Range<usize>]) -> bool {
+        if self.instances.len() == 1 && selections.len() == 1 {
+            return self.contains_selection(selections[0].clone());
+        }
+        if selections.len() != self.instances.len() {
+            return false;
+        }
+        let mut selections = selections.to_vec();
+        selections.sort_by_key(|range| (range.start, range.end));
+        let tabstop_count = self
+            .instances
+            .first()
+            .map_or(0, |instance| instance.tabstops.len());
+        (0..tabstop_count).any(|tabstop_index| {
+            if self.instances[0].tabstops[tabstop_index].index == 0 {
+                return false;
+            }
+            let mut ranges = self
+                .instances
+                .iter()
+                .filter_map(|instance| {
+                    instance
+                        .tabstops
+                        .get(tabstop_index)
+                        .and_then(|tabstop| tabstop.ranges.first())
+                        .cloned()
+                })
+                .collect::<Vec<_>>();
+            ranges.sort_by_key(|range| (range.start, range.end));
+            ranges.len() == selections.len()
+                && ranges.iter().zip(&selections).all(|(range, selection)| {
+                    range.start <= selection.start && selection.end <= range.end
+                })
+        })
+    }
+
     pub(crate) fn move_next(&mut self) -> Option<Range<usize>> {
-        if self.active + 1 >= self.tabstops.len() {
+        if self.active + 1
+            >= self
+                .instances
+                .first()
+                .map_or(0, |instance| instance.tabstops.len())
+        {
             return None;
         }
         self.active += 1;
@@ -287,20 +387,28 @@ impl SnippetSession {
     /// Track a user edit to the active placeholder. Editing anywhere else
     /// invalidates the session so stale tab stops can never mutate the buffer.
     pub(crate) fn track_user_edit(&mut self, edit: Range<usize>, inserted_len: usize) -> bool {
-        let Some(active) = self.active_range() else {
+        let Some(edited_instance) = self.instances.iter().position(|instance| {
+            instance
+                .tabstops
+                .get(self.active)
+                .and_then(|tabstop| tabstop.ranges.first())
+                .is_some_and(|active| edit.start >= active.start && edit.end <= active.end)
+        }) else {
             return false;
         };
-        if edit.start < active.start || edit.end > active.end {
-            return false;
-        }
         let removed_len = edit.end.saturating_sub(edit.start);
         let delta = inserted_len as isize - removed_len as isize;
-        for (tabstop_index, tabstop) in self.tabstops.iter_mut().enumerate() {
-            for (range_index, range) in tabstop.ranges.iter_mut().enumerate() {
-                if tabstop_index == self.active && range_index == 0 {
-                    range.end = range.end.saturating_add_signed(delta).max(range.start);
-                } else {
-                    track_range(range, &edit, inserted_len);
+        for (instance_index, instance) in self.instances.iter_mut().enumerate() {
+            for (tabstop_index, tabstop) in instance.tabstops.iter_mut().enumerate() {
+                for (range_index, range) in tabstop.ranges.iter_mut().enumerate() {
+                    if instance_index == edited_instance
+                        && tabstop_index == self.active
+                        && range_index == 0
+                    {
+                        range.end = range.end.saturating_add_signed(delta).max(range.start);
+                    } else {
+                        track_range(range, &edit, inserted_len);
+                    }
                 }
             }
         }
@@ -308,9 +416,11 @@ impl SnippetSession {
     }
 
     pub(crate) fn track_edit(&mut self, edit: Range<usize>, inserted_len: usize) {
-        for tabstop in &mut self.tabstops {
-            for range in &mut tabstop.ranges {
-                track_range(range, &edit, inserted_len);
+        for instance in &mut self.instances {
+            for tabstop in &mut instance.tabstops {
+                for range in &mut tabstop.ranges {
+                    track_range(range, &edit, inserted_len);
+                }
             }
         }
     }
@@ -906,6 +1016,21 @@ mod tests {
         assert_eq!(session.active_range(), Some(10..12));
         assert_eq!(session.active_mirrors(), &[15..19]);
         assert!(!session.track_user_edit(0..0, 1));
+    }
+
+    #[test]
+    fn multi_snippet_session_keeps_instance_primaries_and_mirrors_separate() {
+        let parsed = parse_snippet("${1:name} = $1;$0");
+        let mut session = SnippetSession::new_many(&parsed, [0, 13]).unwrap();
+        assert_eq!(session.active_ranges(), vec![0..4, 13..17]);
+        assert!(session.track_user_edit(13..17, 2));
+        assert_eq!(session.active_ranges(), vec![0..4, 13..15]);
+        assert_eq!(
+            session.active_mirror_replacements_for_values(&["first".into(), "id".into()]),
+            vec![(7..11, "first".into()), (18..22, "id".into())]
+        );
+        assert!(session.contains_selections(&[0..4, 13..15]));
+        assert!(!session.contains_selections(&[0..4]));
     }
 
     #[test]

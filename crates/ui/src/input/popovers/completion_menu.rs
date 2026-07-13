@@ -772,17 +772,28 @@ impl CompletionMenu {
                         )
                     })
                     .collect::<Vec<_>>();
-                let multi_cursor_applied = multi_cursor_ranges
+                let multi_cursor_snippet_starts = multi_cursor_ranges
                     .filter(|ranges| ranges.len() > 1)
-                    .is_some_and(|ranges| {
-                        editor.apply_multi_cursor_completion(
-                            ranges,
-                            &new_text,
-                            additional_edits.clone(),
-                            window,
-                            cx,
-                        )
+                    .and_then(|ranges| {
+                        editor
+                            .apply_multi_cursor_completion(
+                                ranges,
+                                &new_text,
+                                additional_edits.clone(),
+                                window,
+                                cx,
+                            )
+                            .then(|| {
+                                editor
+                                    .selections()
+                                    .into_iter()
+                                    .map(|selection| {
+                                        selection.head().saturating_sub(new_text.len())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
                     });
+                let multi_cursor_applied = multi_cursor_snippet_starts.is_some();
 
                 if multi_cursor_applied {
                     if let Some(commit_character) = commit_character.as_deref() {
@@ -795,6 +806,12 @@ impl CompletionMenu {
                         ) {
                             editor.replace_text_in_range_silent(None, commit_character, window, cx);
                         }
+                    }
+                    if let (Some(parsed_snippet), Some(insertion_starts)) = (
+                        parsed_snippet.as_ref(),
+                        multi_cursor_snippet_starts.as_ref(),
+                    ) {
+                        editor.start_snippet_sessions(parsed_snippet, insertion_starts, window, cx);
                     }
                 } else {
                     let mut replacements = additional_edits
@@ -1145,7 +1162,7 @@ mod tests {
         collections::VecDeque,
     };
 
-    use gpui::{TestAppContext, VisualTestContext};
+    use gpui::{EntityInputHandler as _, TestAppContext, VisualTestContext};
 
     use crate::{
         Root,
@@ -1493,6 +1510,84 @@ mod tests {
 
         input.read_with(&cx, |input, _| {
             assert_eq!(input.value(), "    if condition {\n        \n    }")
+        });
+    }
+
+    #[gpui::test]
+    fn multi_cursor_snippet_completion_starts_synchronized_tabstop_sessions(
+        cx: &mut TestAppContext,
+    ) {
+        let completion = CompletionItem {
+            label: "format binding".into(),
+            text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit {
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(0, 0),
+                    lsp_types::Position::new(0, 2),
+                ),
+                new_text: "${1:name} = $1;$0".into(),
+            })),
+            insert_text_format: Some(InsertTextFormat::SNIPPET),
+            ..CompletionItem::default()
+        };
+        let provider = Rc::new(TestCompletionProvider {
+            calls: Rc::new(Cell::new(0)),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                completion.clone(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("fo\nfo", window, cx);
+                input.set_editor_selections(
+                    [
+                        crate::input::EditorSelection::caret(2),
+                        crate::input::EditorSelection::caret(5),
+                    ],
+                    cx,
+                );
+            });
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "fo");
+                menu.show(2, vec![completion], false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| menu.on_action_enter(window, cx));
+        });
+        cx.run_until_parked();
+        input.read_with(&cx, |input, _| {
+            assert_eq!(input.value(), "name = name;\nname = name;");
+            assert_eq!(
+                input
+                    .selections()
+                    .into_iter()
+                    .map(|selection| Range::<usize>::from(selection.range))
+                    .collect::<Vec<_>>(),
+                vec![0..4, 13..17]
+            );
+            assert!(input.snippet_session.is_some());
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.replace_text_in_range(None, "item", window, cx);
+                assert_eq!(input.value(), "item = item;\nitem = item;");
+                input.indent_inline(&crate::input::IndentInline, window, cx);
+                assert_eq!(
+                    input
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![12, 25]
+                );
+                assert!(input.snippet_session.is_none());
+            });
         });
     }
 

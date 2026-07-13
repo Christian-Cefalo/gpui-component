@@ -888,7 +888,6 @@ impl InputState {
         let before = self.selections();
         let was_silent = self.silent_replace_text;
         self.cancel_linked_editing(cx);
-        self.snippet_session = None;
         self.secondary_selections.clear();
         self.multi_cursor_editing = true;
         self.start_undo_transaction();
@@ -920,6 +919,19 @@ impl InputState {
             }
         }
 
+        if self.snippet_session.is_some() {
+            _ = self.synchronize_active_snippet_mirrors(window, cx);
+            if let Some(active_ranges) = self
+                .snippet_session
+                .as_ref()
+                .map(|session| session.active_ranges())
+                .filter(|ranges| ranges.len() == before.len())
+            {
+                for (selection_index, range) in active_ranges.into_iter().enumerate() {
+                    results.insert(selection_index, EditorSelection::caret(range.end));
+                }
+            }
+        }
         self.end_undo_transaction();
         self.multi_cursor_editing = false;
         self.silent_replace_text = was_silent;

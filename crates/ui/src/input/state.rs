@@ -3586,7 +3586,10 @@ impl EntityInputHandler for InputState {
         self.update_preferred_column();
         self.update_search(cx);
         self.mode.update_auto_grow(&self.display_map);
-        if !self.snippet_tracking_suspended && self.snippet_session.is_some() {
+        if !self.multi_cursor_editing
+            && !self.snippet_tracking_suspended
+            && self.snippet_session.is_some()
+        {
             let selection_after_user_edit = self.selected_range;
             self.synchronize_active_snippet_mirrors(window, cx);
             self.selected_range = selection_after_user_edit;
@@ -4598,6 +4601,63 @@ mod tests {
                 assert_eq!(state.value(), "name = name;");
                 state.redo(&Redo, window, cx);
                 assert_eq!(state.value(), "item = item;");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn multi_cursor_snippet_session_synchronizes_instances_and_tabstops(cx: &mut TestAppContext) {
+        use crate::input::{IndentInline, snippet::parse_snippet};
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let snippet = parse_snippet("${1:name} = $1;$0");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(format!("{}\n{}", snippet.text, snippet.text), window, cx);
+                state.start_snippet_sessions(&snippet, &[0, 13], window, cx);
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| Range::<usize>::from(selection.range))
+                        .collect::<Vec<_>>(),
+                    vec![0..4, 13..17]
+                );
+                assert!(state.has_active_snippet_session());
+                assert_eq!(state.active_snippet_tabstop_index(), Some(1));
+                assert_eq!(state.active_snippet_instance_count(), 2);
+                assert_eq!(state.active_snippet_tabstop_ranges(), vec![0..4, 13..17]);
+
+                state.replace_text_in_range(None, "item", window, cx);
+                assert_eq!(state.value(), "item = item;\nitem = item;");
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![4, 17]
+                );
+
+                state.indent_inline(&IndentInline, window, cx);
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![12, 25]
+                );
+                assert!(state.snippet_session.is_none());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "name = name;\nname = name;");
+
+                state.start_snippet_sessions(&snippet, &[0, 0], window, cx);
+                assert!(!state.has_active_snippet_session());
             });
         });
     }
