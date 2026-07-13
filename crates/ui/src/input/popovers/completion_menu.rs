@@ -820,6 +820,7 @@ impl CompletionMenu {
                     }
                 }
                 editor.completion_inserting = false;
+                editor.handle_signature_help_text_change(true, cx);
                 editor.end_undo_transaction();
                 // FIXME: Input not get the focus
                 editor.focus(window, cx);
@@ -1102,7 +1103,10 @@ mod tests {
 
     use gpui::{TestAppContext, VisualTestContext};
 
-    use crate::{Root, input::CompletionProvider};
+    use crate::{
+        Root,
+        input::{CompletionProvider, SignatureHelpProvider},
+    };
 
     enum TestCompletionResolution {
         Ready(CompletionItem),
@@ -1112,6 +1116,27 @@ mod tests {
     struct TestCompletionProvider {
         calls: Rc<Cell<usize>>,
         resolutions: RefCell<VecDeque<TestCompletionResolution>>,
+    }
+
+    struct TestSignatureHelpProvider {
+        contexts: Rc<RefCell<Vec<lsp_types::SignatureHelpContext>>>,
+    }
+
+    impl SignatureHelpProvider for TestSignatureHelpProvider {
+        fn trigger_characters(&self, _: &App) -> Vec<String> {
+            vec!["(".into()]
+        }
+
+        fn signature_help(
+            &self,
+            _text: &Rope,
+            _offset: usize,
+            context: lsp_types::SignatureHelpContext,
+            _cx: &mut Context<InputState>,
+        ) -> Task<anyhow::Result<Option<lsp_types::SignatureHelp>>> {
+            self.contexts.borrow_mut().push(context);
+            Task::ready(Ok(None))
+        }
     }
 
     impl CompletionProvider for TestCompletionProvider {
@@ -1667,6 +1692,56 @@ mod tests {
         let existing = Rope::from_str("format(value)");
         assert!(!should_insert_commit_character(&existing, 6, "format", "("));
         assert!(!should_insert_commit_character(&text, 6, "format", "::"));
+    }
+
+    #[gpui::test]
+    fn completion_commit_character_triggers_parameter_hints(cx: &mut TestAppContext) {
+        let completion = CompletionItem {
+            label: "format".into(),
+            insert_text: Some("format".into()),
+            commit_characters: Some(vec!["(".into()]),
+            ..CompletionItem::default()
+        };
+        let provider = Rc::new(TestCompletionProvider {
+            calls: Rc::new(Cell::new(0)),
+            resolutions: RefCell::new(VecDeque::from([TestCompletionResolution::Ready(
+                completion.clone(),
+            )])),
+        });
+        let (input, menu, window) = completion_test_view(cx, provider);
+        let mut cx = VisualTestContext::from_window(window.into(), cx);
+        let contexts = Rc::new(RefCell::new(Vec::new()));
+
+        cx.update(|window, cx| {
+            input.update(cx, |input, _| {
+                input.lsp.signature_help_provider = Some(Rc::new(TestSignatureHelpProvider {
+                    contexts: contexts.clone(),
+                }));
+            });
+            menu.update(cx, |menu, cx| {
+                menu.begin_query(0, "fo");
+                menu.show(2, vec![completion], false, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            menu.update(cx, |menu, cx| {
+                assert!(menu.accept_commit_character("(", window, cx));
+            });
+        });
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(121));
+        cx.run_until_parked();
+
+        input.read_with(&cx, |input, _| assert_eq!(input.value(), "format("));
+        let contexts = contexts.borrow();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(
+            contexts[0].trigger_kind,
+            lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER
+        );
+        assert_eq!(contexts[0].trigger_character.as_deref(), Some("("));
     }
 
     #[test]

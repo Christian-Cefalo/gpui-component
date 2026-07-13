@@ -3057,8 +3057,8 @@ impl EntityInputHandler for InputState {
             self.selected_range = selection_after_user_edit;
             self.update_preferred_column();
         }
+        self.handle_signature_help_text_change(!self.silent_replace_text, cx);
         if !self.silent_replace_text {
-            self.handle_signature_help_text_change(cx);
             self.handle_completion_trigger(&new_text, window, cx);
         }
         if self.emit_events {
@@ -3511,24 +3511,38 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(121));
         cx.run_until_parked();
 
-        cx.update(|_, cx| {
+        cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 let help = state.signature_help(cx).expect("signature help");
                 assert_eq!(help.signatures.len(), 2);
                 assert_eq!(help.active_signature, Some(0));
+                state.replace_text_in_range_silent(None, ",", window, cx);
+            });
+        });
+        cx.executor().advance_clock(Duration::from_millis(121));
+        cx.run_until_parked();
+
+        cx.update(|_, cx| {
+            input.update(cx, |state, cx| {
                 assert!(state.next_parameter_hint(cx));
                 assert_eq!(state.signature_help(cx).unwrap().active_signature, Some(1));
                 assert!(state.next_parameter_hint(cx));
                 assert!(state.signature_help(cx).is_none());
             });
         });
-        assert_eq!(calls.get(), 1);
+        assert_eq!(calls.get(), 2);
         let contexts = contexts.borrow();
         assert_eq!(
             contexts[0].trigger_kind,
             lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER
         );
         assert_eq!(contexts[0].trigger_character.as_deref(), Some("("));
+        assert_eq!(
+            contexts[1].trigger_kind,
+            lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER
+        );
+        assert_eq!(contexts[1].trigger_character.as_deref(), Some(","));
+        assert!(contexts[1].is_retrigger);
         drop(contexts);
 
         cx.update(|window, cx| {
@@ -3546,7 +3560,7 @@ mod tests {
         });
         assert_eq!(
             calls.get(),
-            1,
+            2,
             "superseded delayed request must not dispatch"
         );
     }

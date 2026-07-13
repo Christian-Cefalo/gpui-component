@@ -273,6 +273,7 @@ impl Render for SignatureHelpPopover {
                     })
             },
         )
+        .content_id(("signature-help-popover-content", self.editor.entity_id()))
         .dismiss_signature_help()
         .into_any_element()
     }

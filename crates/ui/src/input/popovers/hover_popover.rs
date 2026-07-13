@@ -74,6 +74,7 @@ pub(crate) struct Popover {
     editor: Entity<InputState>,
     range: Range<usize>,
     width_limit: Range<Pixels>,
+    content_id: ElementId,
     dismiss_behavior: PopoverDismissBehavior,
     content_builder: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
 }
@@ -108,6 +109,7 @@ impl Popover {
             range,
             style: StyleRefinement::default(),
             width_limit: px(200.)..px(500.),
+            content_id: "hover-popover-content".into(),
             dismiss_behavior: PopoverDismissBehavior::Hover,
             content_builder: Box::new(move |window, cx| (f)(window, cx).into_any_element()),
         }
@@ -115,6 +117,11 @@ impl Popover {
 
     pub(crate) fn dismiss_signature_help(mut self) -> Self {
         self.dismiss_behavior = PopoverDismissBehavior::SignatureHelp;
+        self
+    }
+
+    pub(crate) fn content_id(mut self, id: impl Into<ElementId>) -> Self {
+        self.content_id = id.into();
         self
     }
 
@@ -200,7 +207,7 @@ impl Element for Popover {
 
         let mut popover = deferred(
             div()
-                .id("hover-popover-content")
+                .id(self.content_id.clone())
                 .flex_none()
                 .occlude()
                 .p_1()

@@ -171,11 +171,18 @@ impl InputState {
         );
     }
 
-    pub(crate) fn handle_signature_help_text_change(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn handle_signature_help_text_change(
+        &mut self,
+        allow_new_trigger: bool,
+        cx: &mut Context<Self>,
+    ) {
         let Some(provider) = self.lsp.signature_help_provider.clone() else {
             return;
         };
         let active_signature_help = self.active_signature_help(cx);
+        if !allow_new_trigger && active_signature_help.is_none() {
+            return;
+        }
         let mut trigger_characters = provider.trigger_characters(cx);
         if active_signature_help.is_some() {
             trigger_characters.extend(provider.retrigger_characters(cx));
