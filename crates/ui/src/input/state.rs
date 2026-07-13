@@ -1399,11 +1399,13 @@ impl InputState {
     ///
     /// This is intended for trusted editor navigation such as an LSP location
     /// after the host has converted protocol UTF-16 positions into this
-    /// editor's scalar coordinate model.
+    /// editor's scalar coordinate model. `take_focus` allows background
+    /// navigation requests to preserve the user's current focus.
     pub fn set_selection_range(
         &mut self,
         start: impl Into<Position>,
         end: impl Into<Position>,
+        take_focus: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1415,7 +1417,9 @@ impl InputState {
         self.select_to(end, cx);
         self.scroll_to(end, None, cx);
         self.update_preferred_column();
-        self.focus(window, cx);
+        if take_focus {
+            self.focus(window, cx);
+        }
     }
 
     /// Focus the input field.
@@ -3828,7 +3832,22 @@ mod tests {
         cx.update(|window, cx| {
             input.update(cx, |state, cx| {
                 state.set_value("alpha\nbeta\n", window, cx);
-                state.set_selection_range(Position::new(0, 2), Position::new(1, 2), window, cx);
+                state.set_selection_range(
+                    Position::new(0, 2),
+                    Position::new(1, 2),
+                    false,
+                    window,
+                    cx,
+                );
+                assert!(!state.focus_handle.is_focused(window));
+                state.set_selection_range(
+                    Position::new(0, 2),
+                    Position::new(1, 2),
+                    true,
+                    window,
+                    cx,
+                );
+                assert!(state.focus_handle.is_focused(window));
             });
         });
 
