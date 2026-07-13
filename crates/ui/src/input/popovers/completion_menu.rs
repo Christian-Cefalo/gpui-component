@@ -665,9 +665,9 @@ impl CompletionMenu {
             && self.resolution.resolving_index == selected_index)
             .then(|| self.pending_resolution.clone())
             .flatten();
-        let (expected_text, expected_cursor) = {
+        let (expected_text, expected_cursor, expected_selections) = {
             let editor = editor.read(cx);
-            (editor.text.clone(), editor.cursor())
+            (editor.text.clone(), editor.cursor(), editor.selections())
         };
         let Some(trigger_range) =
             completion_trigger_range(self.trigger_start_offset, self.offset, expected_cursor)
@@ -698,7 +698,10 @@ impl CompletionMenu {
             };
             let accepted = item.clone();
             let inserted = editor.update_in(cx, |editor, window, cx| {
-                if editor.cursor() != expected_cursor || editor.text != expected_text {
+                if editor.cursor() != expected_cursor
+                    || editor.text != expected_text
+                    || editor.selections() != expected_selections
+                {
                     return false;
                 }
                 editor.start_undo_transaction();
@@ -744,7 +747,19 @@ impl CompletionMenu {
                     None => new_text,
                 };
 
-                let mut replacements = item
+                let multi_cursor_ranges = if editor.has_multiple_selections() {
+                    editor.multi_cursor_completion_ranges(range.clone())
+                } else {
+                    None
+                };
+                if editor.has_multiple_selections() && multi_cursor_ranges.is_none() {
+                    // A secondary caret with a different prefix cannot safely
+                    // receive this server response. Preserve the completion at
+                    // the primary caret and collapse stale secondary ranges.
+                    editor.clear_secondary_selections(cx);
+                }
+
+                let additional_edits = item
                     .additional_text_edits
                     .as_ref()
                     .into_iter()
@@ -754,41 +769,22 @@ impl CompletionMenu {
                             editor.text.position_to_offset(&edit.range.start)
                                 ..editor.text.position_to_offset(&edit.range.end),
                             edit.new_text.clone(),
-                            false,
                         )
                     })
                     .collect::<Vec<_>>();
-                replacements.push((range.clone(), new_text.clone(), true));
-                replacements.sort_by_key(|(range, _, _)| (range.start, range.end));
-                let valid = replacements.iter().all(|(range, _, _)| {
-                    range.start <= range.end && range.end <= editor.text.len()
-                }) && replacements
-                    .windows(2)
-                    .all(|pair| pair[0].0.end <= pair[1].0.start);
-                if valid {
-                    let shift_before_primary = replacements
-                        .iter()
-                        .filter(|(edit_range, _, primary)| {
-                            !primary && edit_range.end <= range.start
-                        })
-                        .map(|(edit_range, text, _)| {
-                            text.len() as isize - (edit_range.end - edit_range.start) as isize
-                        })
-                        .sum::<isize>();
-                    let snippet_start = range.start.saturating_add_signed(shift_before_primary);
-                    let cursor = snippet_start + new_text.len();
-                    for (edit_range, text, _) in replacements.into_iter().rev() {
-                        editor.replace_text_in_range_silent(
-                            Some(editor.range_to_utf16(&edit_range)),
-                            &text,
+                let multi_cursor_applied = multi_cursor_ranges
+                    .filter(|ranges| ranges.len() > 1)
+                    .is_some_and(|ranges| {
+                        editor.apply_multi_cursor_completion(
+                            ranges,
+                            &new_text,
+                            additional_edits.clone(),
                             window,
                             cx,
-                        );
-                    }
-                    let cursor = editor
-                        .text
-                        .offset_to_position(cursor.min(editor.text.len()));
-                    editor.set_cursor_position(cursor, window, cx);
+                        )
+                    });
+
+                if multi_cursor_applied {
                     if let Some(commit_character) = commit_character.as_deref() {
                         let cursor = editor.cursor();
                         if should_insert_commit_character(
@@ -797,26 +793,74 @@ impl CompletionMenu {
                             &new_text,
                             commit_character,
                         ) {
+                            editor.replace_text_in_range_silent(None, commit_character, window, cx);
+                        }
+                    }
+                } else {
+                    let mut replacements = additional_edits
+                        .into_iter()
+                        .map(|(range, text)| (range, text, false))
+                        .collect::<Vec<_>>();
+                    replacements.push((range.clone(), new_text.clone(), true));
+                    replacements.sort_by_key(|(range, _, _)| (range.start, range.end));
+                    let valid = replacements.iter().all(|(range, _, _)| {
+                        range.start <= range.end && range.end <= editor.text.len()
+                    }) && replacements
+                        .windows(2)
+                        .all(|pair| pair[0].0.end <= pair[1].0.start);
+                    if valid {
+                        let shift_before_primary = replacements
+                            .iter()
+                            .filter(|(edit_range, _, primary)| {
+                                !primary && edit_range.end <= range.start
+                            })
+                            .map(|(edit_range, text, _)| {
+                                text.len() as isize - (edit_range.end - edit_range.start) as isize
+                            })
+                            .sum::<isize>();
+                        let snippet_start = range.start.saturating_add_signed(shift_before_primary);
+                        let cursor = snippet_start + new_text.len();
+                        for (edit_range, text, _) in replacements.into_iter().rev() {
                             editor.replace_text_in_range_silent(
-                                Some(editor.range_to_utf16(&(cursor..cursor))),
-                                commit_character,
+                                Some(editor.range_to_utf16(&edit_range)),
+                                &text,
                                 window,
                                 cx,
                             );
                         }
-                    }
-                    if let Some(parsed_snippet) = parsed_snippet.as_ref() {
-                        editor.start_snippet_session(parsed_snippet, snippet_start, window, cx);
-                    }
-                } else {
-                    editor.replace_text_in_range_silent(
-                        Some(editor.range_to_utf16(&range)),
-                        &new_text,
-                        window,
-                        cx,
-                    );
-                    if let Some(parsed_snippet) = parsed_snippet.as_ref() {
-                        editor.start_snippet_session(parsed_snippet, range.start, window, cx);
+                        let cursor = editor
+                            .text
+                            .offset_to_position(cursor.min(editor.text.len()));
+                        editor.set_cursor_position(cursor, window, cx);
+                        if let Some(commit_character) = commit_character.as_deref() {
+                            let cursor = editor.cursor();
+                            if should_insert_commit_character(
+                                &editor.text,
+                                cursor,
+                                &new_text,
+                                commit_character,
+                            ) {
+                                editor.replace_text_in_range_silent(
+                                    Some(editor.range_to_utf16(&(cursor..cursor))),
+                                    commit_character,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }
+                        if let Some(parsed_snippet) = parsed_snippet.as_ref() {
+                            editor.start_snippet_session(parsed_snippet, snippet_start, window, cx);
+                        }
+                    } else {
+                        editor.replace_text_in_range_silent(
+                            Some(editor.range_to_utf16(&range)),
+                            &new_text,
+                            window,
+                            cx,
+                        );
+                        if let Some(parsed_snippet) = parsed_snippet.as_ref() {
+                            editor.start_snippet_session(parsed_snippet, range.start, window, cx);
+                        }
                     }
                 }
                 editor.completion_inserting = false;

@@ -46,6 +46,7 @@ impl InputState {
     ) {
         let offset = offset.clamp(0, self.text.len());
         self.cursor_line_end_affinity = false;
+        self.secondary_selections.clear();
         self.selected_range = (offset..offset).into();
         self.cancel_snippet_session_if_selection_outside(cx);
         self.scroll_to(offset, direction, cx);
@@ -141,6 +142,10 @@ impl InputState {
     }
 
     pub(super) fn left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_horizontal(false, cx);
+            return;
+        }
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor()), None, cx);
@@ -150,6 +155,10 @@ impl InputState {
     }
 
     pub(super) fn right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_horizontal(true, cx);
+            return;
+        }
         self.pause_blink_cursor(cx);
         if self.selected_range.is_empty() {
             self.move_to(self.next_boundary(self.selected_range.end), None, cx);
@@ -167,6 +176,10 @@ impl InputState {
         }
 
         if self.mode.is_single_line() {
+            return;
+        }
+        if self.has_multiple_selections() {
+            self.move_all_cursors_vertical(-1, cx);
             return;
         }
 
@@ -190,6 +203,10 @@ impl InputState {
         }
 
         if self.mode.is_single_line() {
+            return;
+        }
+        if self.has_multiple_selections() {
+            self.move_all_cursors_vertical(1, cx);
             return;
         }
 
@@ -237,12 +254,20 @@ impl InputState {
     }
 
     pub(super) fn home(&mut self, _: &MoveHome, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_line_boundary(false, false, cx);
+            return;
+        }
         self.pause_blink_cursor(cx);
         let offset = self.start_of_line();
         self.move_to(offset, Some(MoveDirection::Up), cx);
     }
 
     pub(super) fn end(&mut self, _: &MoveEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_line_boundary(true, false, cx);
+            return;
+        }
         self.pause_blink_cursor(cx);
         let offset = self.end_of_line();
         self.move_to(offset, Some(MoveDirection::Down), cx);
@@ -255,10 +280,18 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_document_boundary(false, false, cx);
+            return;
+        }
         self.move_to(0, None, cx);
     }
 
     pub(super) fn move_to_end(&mut self, _: &MoveToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_document_boundary(true, false, cx);
+            return;
+        }
         self.move_to(self.text.len(), None, cx);
     }
 
@@ -268,6 +301,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_by_word(false, false, cx);
+            return;
+        }
         let offset = self.previous_start_of_word();
         self.move_to(offset, None, cx);
     }
@@ -278,6 +315,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_by_word(true, false, cx);
+            return;
+        }
         let offset = self.next_end_of_word();
         self.move_to(offset, None, cx);
     }

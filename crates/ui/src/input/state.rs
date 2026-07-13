@@ -16,6 +16,7 @@ use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::collections::BTreeMap;
 use std::ops::Range;
 use std::rc::Rc;
 use sum_tree::Bias;
@@ -38,8 +39,9 @@ use crate::highlighter::DiagnosticSet;
 use crate::highlighter::LanguageRegistry;
 use crate::input::blink_cursor::CURSOR_WIDTH;
 use crate::input::movement::MoveDirection;
+use crate::input::multi_cursor::MultiCursorDelete;
 use crate::input::{
-    HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
+    EditorSelection, HoverDefinition, InlineCompletion, Lsp, Position, RopeExt as _, Selection,
     display_map::LineLayout,
     element::RIGHT_MARGIN,
     pairs::{
@@ -53,7 +55,10 @@ use crate::input::{
 };
 use crate::native_menu::NativeMenu;
 use crate::scroll::AutoScroll;
-use crate::{Root, history::History};
+use crate::{
+    Root,
+    history::{History, HistoryItem as _},
+};
 
 #[derive(Action, Clone, PartialEq, Eq, Deserialize)]
 #[action(namespace = input, no_json)]
@@ -120,6 +125,9 @@ actions!(
         MoveToEnd,
         MoveToPreviousWord,
         MoveToNextWord,
+        AddCursorAbove,
+        AddCursorBelow,
+        RemoveSecondaryCursors,
         Escape,
         TriggerCompletion,
         ToggleCodeActions,
@@ -196,6 +204,18 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("down", MoveDown, Some(CONTEXT)),
         KeyBinding::new("left", MoveLeft, Some(CONTEXT)),
         KeyBinding::new("right", MoveRight, Some(CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("shift-alt-up", AddCursorAbove, Some(CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("shift-alt-down", AddCursorBelow, Some(CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("ctrl-shift-up", AddCursorAbove, Some(CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("ctrl-shift-down", AddCursorBelow, Some(CONTEXT)),
+        #[cfg(not(target_os = "linux"))]
+        KeyBinding::new("ctrl-alt-up", AddCursorAbove, Some(CONTEXT)),
+        #[cfg(not(target_os = "linux"))]
+        KeyBinding::new("ctrl-alt-down", AddCursorBelow, Some(CONTEXT)),
         KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
         KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
         KeyBinding::new("tab", IndentInline, Some(CONTEXT)),
@@ -407,12 +427,19 @@ pub struct InputState {
     /// - "Hello 世界💝" = 16
     /// - "💝" = 4
     pub(super) selected_range: Selection,
+    /// Secondary selections for multi-cursor editing. The existing
+    /// `selected_range` remains the primary selection for API compatibility.
+    pub(super) secondary_selections: Vec<EditorSelection>,
     pub(super) search_panel: Option<Entity<SearchPanel>>,
     pub(super) searchable: bool,
     pub(super) replaceable: bool,
     /// Range for save the selected word, use to keep word range when drag move.
     pub(super) selected_word_range: Option<Selection>,
     pub(super) selection_reversed: bool,
+    /// Prevent the per-selection edit loop from recursively fanning out.
+    pub(super) multi_cursor_editing: bool,
+    /// Selection snapshots keyed by the explicit undo transaction version.
+    pub(super) multi_cursor_history: BTreeMap<usize, super::multi_cursor::MultiCursorHistoryEntry>,
     /// The marked range is the temporary insert text on IME typing.
     pub(super) ime_marked_range: Option<Selection>,
     pub(super) last_layout: Option<LastLayout>,
@@ -559,11 +586,14 @@ impl InputState {
             blink_cursor,
             history,
             selected_range: Selection::default(),
+            secondary_selections: Vec::new(),
             search_panel: None,
             searchable: false,
             replaceable: true,
             selected_word_range: None,
             selection_reversed: false,
+            multi_cursor_editing: false,
+            multi_cursor_history: BTreeMap::new(),
             ime_marked_range: None,
             input_bounds: Bounds::default(),
             selecting: false,
@@ -958,6 +988,7 @@ impl InputState {
         self.reset_scroll_to_start();
 
         self.history.clear();
+        self.multi_cursor_history.clear();
         cx.notify();
     }
 
@@ -1045,6 +1076,8 @@ impl InputState {
         } else {
             self.selected_range.clear();
         }
+        self.secondary_selections.clear();
+        self.selection_reversed = false;
     }
 
     fn reset_lsp_state(&mut self) {
@@ -1440,15 +1473,27 @@ impl InputState {
     }
 
     pub(super) fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.select_all_cursors_horizontal(false, cx);
+            return;
+        }
         self.select_to(self.previous_boundary(self.cursor()), cx);
     }
 
     pub(super) fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.select_all_cursors_horizontal(true, cx);
+            return;
+        }
         self.select_to(self.next_boundary(self.cursor()), cx);
     }
 
     pub(super) fn select_up(&mut self, _: &SelectUp, _: &mut Window, cx: &mut Context<Self>) {
         if self.mode.is_single_line() {
+            return;
+        }
+        if self.has_multiple_selections() {
+            self.select_all_cursors_vertical(-1, cx);
             return;
         }
         let offset = self.start_of_line().saturating_sub(1);
@@ -1459,11 +1504,17 @@ impl InputState {
         if self.mode.is_single_line() {
             return;
         }
+        if self.has_multiple_selections() {
+            self.select_all_cursors_vertical(1, cx);
+            return;
+        }
         let offset = (self.end_of_line() + 1).min(self.text.len());
         self.select_to(self.next_boundary(offset), cx);
     }
 
     pub(super) fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.secondary_selections.clear();
+        self.selection_reversed = false;
         self.selected_range = (0..self.text.len()).into();
         self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
@@ -1478,6 +1529,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_document_boundary(false, true, cx);
+            return;
+        }
         self.select_to(0, cx);
     }
 
@@ -1487,6 +1542,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_document_boundary(true, true, cx);
+            return;
+        }
         let end = self.text.len();
         self.select_to(end, cx);
     }
@@ -1497,6 +1556,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_line_boundary(false, true, cx);
+            return;
+        }
         let offset = self.start_of_line();
         self.select_to(offset, cx);
     }
@@ -1507,6 +1570,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_to_line_boundary(true, true, cx);
+            return;
+        }
         let offset = self.end_of_line();
         self.select_to(offset, cx);
     }
@@ -1517,6 +1584,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_by_word(false, true, cx);
+            return;
+        }
         let offset = self.previous_start_of_word();
         self.select_to(offset, cx);
     }
@@ -1527,6 +1598,10 @@ impl InputState {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.move_all_cursors_by_word(true, true, cx);
+            return;
+        }
         let offset = self.next_end_of_word();
         self.select_to(offset, cx);
     }
@@ -1678,6 +1753,10 @@ impl InputState {
     }
 
     pub(super) fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::Backward, window, cx);
+            return;
+        }
         if self.selected_range.is_empty()
             && let Some(range) = self.paired_backspace_range()
         {
@@ -1694,6 +1773,10 @@ impl InputState {
     }
 
     pub(super) fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::Forward, window, cx);
+            return;
+        }
         if self.selected_range.is_empty() {
             self.select_to(self.next_boundary(self.cursor()), cx)
         }
@@ -1707,6 +1790,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::ToLineStart, window, cx);
+            return;
+        }
         if !self.selected_range.is_empty() {
             self.replace_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
@@ -1732,6 +1819,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::ToLineEnd, window, cx);
+            return;
+        }
         if !self.selected_range.is_empty() {
             self.replace_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
@@ -1757,6 +1848,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::PreviousWord, window, cx);
+            return;
+        }
         if !self.selected_range.is_empty() {
             self.replace_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
@@ -1779,6 +1874,10 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.has_multiple_selections() {
+            self.delete_at_all_selections(MultiCursorDelete::NextWord, window, cx);
+            return;
+        }
         if !self.selected_range.is_empty() {
             self.replace_text_in_range(None, "", window, cx);
             self.pause_blink_cursor(cx);
@@ -1812,6 +1911,21 @@ impl InputState {
         let insert_newline = self.mode.is_multi_line() && (!self.submit_on_enter || action.shift);
 
         if insert_newline {
+            if self.has_multiple_selections() {
+                let ranges = self
+                    .selections()
+                    .into_iter()
+                    .map(|selection| selection.range.into())
+                    .collect::<Vec<_>>();
+                let texts = self.newline_texts_for_selections();
+                self.replace_selection_ranges(ranges, texts, window, cx);
+                self.pause_blink_cursor(cx);
+                cx.emit(InputEvent::PressEnter {
+                    secondary: action.secondary,
+                    shift: action.shift,
+                });
+                return;
+            }
             // Get current line indent
             let indent = if self.mode.is_code_editor() {
                 self.indent_of_next_line()
@@ -1837,6 +1951,8 @@ impl InputState {
 
     pub(super) fn clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text("", window, cx);
+        self.secondary_selections.clear();
+        self.selection_reversed = false;
         self.selected_range = (0..0).into();
         self.scroll_to(0, None, cx);
     }
@@ -1857,6 +1973,10 @@ impl InputState {
         }
 
         if self.cancel_linked_editing(cx) {
+            return;
+        }
+
+        if self.clear_secondary_selections(cx) {
             return;
         }
 
@@ -1883,7 +2003,11 @@ impl InputState {
             return;
         }
 
-        if !self.selected_range.contains(offset) {
+        if !self
+            .selections()
+            .iter()
+            .any(|selection| selection.range.contains(offset))
+        {
             self.move_to(offset, None, cx);
         }
 
@@ -1901,7 +2025,10 @@ impl InputState {
             let has_document_link = is_enable && self.has_document_link_at_cursor();
             let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
             let has_linked_editing = is_enable && self.lsp.linked_editing_range_provider.is_some();
-            let is_selected = !self.selected_range.is_empty();
+            let is_selected = self
+                .selections()
+                .iter()
+                .any(|selection| !selection.is_empty());
             let has_paste = is_enable && cx.read_from_clipboard().is_some();
 
             let mut menu = NativeMenu::new();
@@ -1984,7 +2111,6 @@ impl InputState {
             return;
         }
 
-        self.selecting = true;
         let offset = self.index_for_mouse_position(event.position);
 
         if self.handle_click_document_link(event, offset, window, cx) {
@@ -1994,6 +2120,15 @@ impl InputState {
         if self.handle_click_hover_definition(event, offset, window, cx) {
             return;
         }
+
+        if event.button == MouseButton::Left && event.modifiers.alt {
+            self.selecting = false;
+            self.toggle_cursor_at_offset(offset, cx);
+            self.focus(window, cx);
+            return;
+        }
+
+        self.selecting = true;
 
         // Triple click to select line
         if event.button == MouseButton::Left && event.click_count >= 3 {
@@ -2016,6 +2151,7 @@ impl InputState {
         }
 
         if event.modifiers.shift {
+            self.secondary_selections.clear();
             self.select_to(offset, cx);
         } else {
             self.move_to(offset, None, cx)
@@ -2261,6 +2397,12 @@ impl InputState {
     }
 
     pub(super) fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            if let Some(selected_text) = self.selected_text_for_all_selections() {
+                cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+            }
+            return;
+        }
         if self.selected_range.is_empty() {
             return;
         }
@@ -2270,6 +2412,23 @@ impl InputState {
     }
 
     pub(super) fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_multiple_selections() {
+            let Some(selected_text) = self.selected_text_for_all_selections() else {
+                return;
+            };
+            cx.write_to_clipboard(ClipboardItem::new_string(selected_text));
+            let selections = self.selections();
+            self.replace_selection_ranges(
+                selections
+                    .iter()
+                    .map(|selection| selection.range.into())
+                    .collect(),
+                vec![String::new(); selections.len()],
+                window,
+                cx,
+            );
+            return;
+        }
         if self.selected_range.is_empty() {
             return;
         }
@@ -2311,9 +2470,14 @@ impl InputState {
         self.linked_editing_tracking_suspended = true;
         self.history.ignore = true;
         if let Some(changes) = self.history.undo() {
+            let version = changes.first().map(|change| change.version());
+            self.secondary_selections.clear();
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.new_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.old_text, window, cx);
+            }
+            if let Some(version) = version {
+                self.restore_multi_cursor_history(version, true, cx);
             }
         }
         self.history.ignore = false;
@@ -2325,9 +2489,14 @@ impl InputState {
         self.linked_editing_tracking_suspended = true;
         self.history.ignore = true;
         if let Some(changes) = self.history.redo() {
+            let version = changes.first().map(|change| change.version());
+            self.secondary_selections.clear();
             for change in changes {
                 let range_utf16 = self.range_to_utf16(&change.old_range.into());
                 self.replace_text_in_range_silent(Some(range_utf16), &change.new_text, window, cx);
+            }
+            if let Some(version) = version {
+                self.restore_multi_cursor_history(version, false, cx);
             }
         }
         self.history.ignore = false;
@@ -2509,6 +2678,8 @@ impl InputState {
     /// Unselects the currently selected text.
     pub fn unselect(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let offset = self.cursor();
+        self.secondary_selections.clear();
+        self.selection_reversed = false;
         self.selected_range = (offset..offset).into();
         self.close_signature_help(cx);
         self.cancel_snippet_session_if_selection_outside(cx);
@@ -2815,17 +2986,21 @@ impl InputState {
         true
     }
 
-    fn paired_backspace_range(&self) -> Option<Range<usize>> {
-        let cursor = self.cursor();
+    pub(super) fn paired_backspace_range_at(&self, cursor: usize) -> Option<Range<usize>> {
         let (base, text) = self.pair_text_window(cursor, 64, 64);
         let tracked = self.local_tracked_pairs(base, base + text.len());
         super::pairs::paired_backspace_range(&text, cursor.saturating_sub(base), &tracked)
             .map(|range| base + range.start..base + range.end)
     }
 
+    fn paired_backspace_range(&self) -> Option<Range<usize>> {
+        self.paired_backspace_range_at(self.cursor())
+    }
+
     pub(super) fn refresh_bracket_match(&mut self) {
         if !self.mode.is_code_editor()
             || !self.selected_range.is_empty()
+            || self.has_multiple_selections()
             || self.language_configuration.brackets().is_empty()
         {
             self.bracket_match = None;
@@ -3236,6 +3411,18 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        let targets_primary_selection = range_utf16.as_ref().is_some_and(|range_utf16| {
+            self.range_from_utf16(range_utf16) == Range::<usize>::from(self.selected_range)
+        });
+        if !self.multi_cursor_editing
+            && self.ime_marked_range.is_none()
+            && self.has_multiple_selections()
+            && (range_utf16.is_none() || (!self.silent_replace_text && targets_primary_selection))
+        {
+            self.replace_all_selections(new_text, window, cx);
+            return;
+        }
+
         if !self.completion_inserting
             && self.accept_completion_commit_character(new_text, window, cx)
         {
@@ -3394,13 +3581,15 @@ impl EntityInputHandler for InputState {
             self.update_preferred_column();
             self.end_undo_transaction();
         }
-        self.handle_signature_help_text_change(!self.silent_replace_text, cx);
-        if !self.silent_replace_text {
-            self.handle_completion_trigger(&new_text, window, cx);
-        }
-        if self.emit_events {
-            cx.emit(InputEvent::Change);
-            cx.emit(InputEvent::SelectionChange);
+        if !self.multi_cursor_editing {
+            self.handle_signature_help_text_change(!self.silent_replace_text, cx);
+            if !self.silent_replace_text {
+                self.handle_completion_trigger(&new_text, window, cx);
+            }
+            if self.emit_events {
+                cx.emit(InputEvent::Change);
+                cx.emit(InputEvent::SelectionChange);
+            }
         }
         self.refresh_bracket_match();
         cx.notify();
@@ -3418,6 +3607,11 @@ impl EntityInputHandler for InputState {
         if self.disabled {
             return;
         }
+
+        // IME composition has one platform-owned marked range. Collapse to the
+        // primary selection before composition so secondary carets cannot
+        // retain stale byte offsets.
+        self.secondary_selections.clear();
 
         self.clear_hover_state(cx);
 

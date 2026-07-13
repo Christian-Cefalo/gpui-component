@@ -13,6 +13,7 @@ mod lsp;
 mod mask_pattern;
 mod mode;
 mod movement;
+mod multi_cursor;
 mod number_input;
 mod otp_input;
 mod pairs;
