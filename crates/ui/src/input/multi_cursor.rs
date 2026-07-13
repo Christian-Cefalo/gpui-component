@@ -185,22 +185,22 @@ impl InputState {
         self.commit_multi_cursor_movement(selections, cx);
     }
 
-    pub(super) fn add_cursor_above(
+    pub(super) fn on_add_cursor_above(
         &mut self,
         _: &AddCursorAbove,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_cursors_vertically(-1, cx);
+        self.add_cursor_above(cx);
     }
 
-    pub(super) fn add_cursor_below(
+    pub(super) fn on_add_cursor_below(
         &mut self,
         _: &AddCursorBelow,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.add_cursors_vertically(1, cx);
+        self.add_cursor_below(cx);
     }
 
     pub(super) fn remove_secondary_cursors(
@@ -234,6 +234,30 @@ impl InputState {
 
     pub fn has_multiple_selections(&self) -> bool {
         !self.secondary_selections.is_empty()
+    }
+
+    /// Add a collapsed secondary caret on the logical line above each current
+    /// selection, preserving the primary selection.
+    pub fn add_cursor_above(&mut self, cx: &mut Context<Self>) {
+        self.add_cursors_vertically(-1, cx);
+    }
+
+    /// Add a collapsed secondary caret on the logical line below each current
+    /// selection, preserving the primary selection.
+    pub fn add_cursor_below(&mut self, cx: &mut Context<Self>) {
+        self.add_cursors_vertically(1, cx);
+    }
+
+    /// Add a collapsed secondary caret at a UTF-8 byte offset. Invalid offsets
+    /// are clipped to a scalar boundary and duplicate/overlapping selections
+    /// are normalized away.
+    pub fn add_cursor_at_offset(&mut self, offset: usize, cx: &mut Context<Self>) {
+        let offset = self
+            .text
+            .clip_offset(offset.min(self.text.len()), Bias::Left);
+        let mut selections = self.selections();
+        selections.push(EditorSelection::caret(offset));
+        self.set_editor_selections(selections, cx);
     }
 
     pub(super) fn secondary_editor_selections(&self) -> &[EditorSelection] {
@@ -384,9 +408,7 @@ impl InputState {
             return;
         }
 
-        let mut selections = self.selections();
-        selections.push(EditorSelection::caret(offset));
-        self.set_editor_selections(selections, cx);
+        self.add_cursor_at_offset(offset, cx);
     }
 
     fn offset_on_adjacent_line(&self, offset: usize, direction: isize) -> Option<usize> {

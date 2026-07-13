@@ -347,8 +347,8 @@ impl RenderOnce for Input {
                 let result = this
                     .on_action(window.listener_for(&self.state, InputState::up))
                     .on_action(window.listener_for(&self.state, InputState::down))
-                    .on_action(window.listener_for(&self.state, InputState::add_cursor_above))
-                    .on_action(window.listener_for(&self.state, InputState::add_cursor_below))
+                    .on_action(window.listener_for(&self.state, InputState::on_add_cursor_above))
+                    .on_action(window.listener_for(&self.state, InputState::on_add_cursor_below))
                     .on_action(window.listener_for(&self.state, InputState::select_up))
                     .on_action(window.listener_for(&self.state, InputState::select_down))
                     .on_action(window.listener_for(&self.state, InputState::page_up))
