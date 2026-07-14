@@ -437,6 +437,7 @@ pub struct InputState {
     /// allowing undo/redo to report clean again when it returns to the exact
     /// persisted text.
     saved_text: Rope,
+    dirty: bool,
     pub(super) display_map: DisplayMap,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -605,6 +606,7 @@ impl InputState {
             focus_handle: focus_handle.clone(),
             text: "".into(),
             saved_text: "".into(),
+            dirty: false,
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -1014,6 +1016,7 @@ impl InputState {
         self.history.clear();
         self.multi_cursor_history.clear();
         self.saved_text = self.text.clone();
+        self.dirty = false;
         cx.notify();
     }
 
@@ -1410,6 +1413,7 @@ impl InputState {
         let text: SharedString = value.into();
         self.text = Rope::from(text.as_str());
         self.saved_text = self.text.clone();
+        self.dirty = false;
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -1427,7 +1431,7 @@ impl InputState {
     /// Return whether the current text differs from the host's last save
     /// point. Undoing back to that exact text clears the dirty state.
     pub fn is_dirty(&self) -> bool {
-        self.text != self.saved_text
+        self.dirty
     }
 
     /// Accept the current text as persisted without clearing undo history.
@@ -1436,6 +1440,7 @@ impl InputState {
             return;
         }
         self.saved_text = self.text.clone();
+        self.dirty = false;
         cx.notify();
     }
 
@@ -3629,6 +3634,7 @@ impl EntityInputHandler for InputState {
             self.update_preferred_column();
             self.end_undo_transaction();
         }
+        self.dirty = self.text != self.saved_text;
         if !self.multi_cursor_editing {
             self.handle_signature_help_text_change(!self.silent_replace_text, cx);
             if !self.silent_replace_text {
@@ -3730,6 +3736,7 @@ impl EntityInputHandler for InputState {
         self.mode.update_auto_grow(&self.display_map);
         self.history.start_grouping();
         self.push_history(&old_text, &range, new_text);
+        self.dirty = self.text != self.saved_text;
         cx.notify();
     }
 
