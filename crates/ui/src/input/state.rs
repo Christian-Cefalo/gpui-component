@@ -431,6 +431,12 @@ pub struct InputState {
     pub(super) focus_handle: FocusHandle,
     pub(super) mode: InputMode,
     pub(super) text: Rope,
+    /// The last value explicitly accepted by the host as persisted.
+    ///
+    /// Keeping this as a Rope makes the save point cheap to retain while
+    /// allowing undo/redo to report clean again when it returns to the exact
+    /// persisted text.
+    saved_text: Rope,
     pub(super) display_map: DisplayMap,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -598,6 +604,7 @@ impl InputState {
         Self {
             focus_handle: focus_handle.clone(),
             text: "".into(),
+            saved_text: "".into(),
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -1006,6 +1013,7 @@ impl InputState {
 
         self.history.clear();
         self.multi_cursor_history.clear();
+        self.saved_text = self.text.clone();
         cx.notify();
     }
 
@@ -1401,6 +1409,7 @@ impl InputState {
     pub fn default_value(mut self, value: impl Into<SharedString>) -> Self {
         let text: SharedString = value.into();
         self.text = Rope::from(text.as_str());
+        self.saved_text = self.text.clone();
         if let Some(diagnostics) = self.mode.diagnostics_mut() {
             diagnostics.reset(&self.text)
         }
@@ -1413,6 +1422,21 @@ impl InputState {
     /// Return the value of the input field.
     pub fn value(&self) -> SharedString {
         SharedString::new(self.text.to_string())
+    }
+
+    /// Return whether the current text differs from the host's last save
+    /// point. Undoing back to that exact text clears the dirty state.
+    pub fn is_dirty(&self) -> bool {
+        self.text != self.saved_text
+    }
+
+    /// Accept the current text as persisted without clearing undo history.
+    pub fn mark_saved(&mut self, cx: &mut Context<Self>) {
+        if !self.is_dirty() {
+            return;
+        }
+        self.saved_text = self.text.clone();
+        cx.notify();
     }
 
     /// Return the portion of the value within the input field that
@@ -5465,6 +5489,42 @@ ORDER BY id
                 // Redo reapplies the replacement.
                 state.redo(&Redo, window, cx);
                 assert_eq!(state.value(), "second");
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn dirty_state_tracks_save_points_and_undo_redo(cx: &mut TestAppContext) {
+        let input_view = InputView::build(cx, |state| state);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("first", window, cx);
+                assert!(!state.is_dirty());
+
+                state.replace_all("second", window, cx);
+                assert!(state.is_dirty());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "first");
+                assert!(!state.is_dirty());
+
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "second");
+                assert!(state.is_dirty());
+
+                state.mark_saved(cx);
+                assert!(!state.is_dirty());
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.value(), "first");
+                assert!(state.is_dirty());
+
+                state.redo(&Redo, window, cx);
+                assert_eq!(state.value(), "second");
+                assert!(!state.is_dirty());
             });
         });
     }
