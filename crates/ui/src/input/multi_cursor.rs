@@ -863,6 +863,117 @@ impl InputState {
         }
     }
 
+    fn transform_selection_after_external_edit(
+        selection: EditorSelection,
+        edit_range: &Range<usize>,
+        replacement_len: usize,
+    ) -> EditorSelection {
+        let transform = |offset: usize| {
+            if edit_range.is_empty() {
+                return if offset >= edit_range.start {
+                    offset.saturating_add(replacement_len)
+                } else {
+                    offset
+                };
+            }
+            if offset < edit_range.start {
+                offset
+            } else if offset == edit_range.start {
+                edit_range.start
+            } else if offset >= edit_range.end {
+                offset.saturating_add_signed(replacement_len as isize - edit_range.len() as isize)
+            } else {
+                edit_range
+                    .start
+                    .saturating_add((offset - edit_range.start).min(replacement_len))
+            }
+        };
+        EditorSelection {
+            range: Selection::new(
+                transform(selection.range.start),
+                transform(selection.range.end),
+            ),
+            reversed: selection.reversed,
+        }
+    }
+
+    /// Apply validated host/provider edits as one undo transaction while
+    /// preserving and transforming every editor selection.
+    ///
+    /// Ranges use UTF-8 byte offsets into the current text. Invalid,
+    /// overlapping, or non-character-boundary ranges are rejected without
+    /// changing the buffer. Edits at the same insertion point retain caller
+    /// order.
+    pub fn apply_buffer_edits(
+        &mut self,
+        mut edits: Vec<(Range<usize>, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if edits.is_empty()
+            || edits.iter().any(|(range, _)| {
+                range.start > range.end
+                    || range.end > self.text.len()
+                    || !self.text.is_char_boundary(range.start)
+                    || !self.text.is_char_boundary(range.end)
+            })
+        {
+            return false;
+        }
+        edits.retain(|(range, text)| self.text.slice(range.clone()).to_string() != *text);
+        if edits.is_empty() {
+            return false;
+        }
+        edits.sort_by_key(|(range, _)| (range.start, range.end));
+        if edits.windows(2).any(|pair| pair[0].0.end > pair[1].0.start) {
+            return false;
+        }
+
+        let before = self.selections();
+        let mut after = before.clone();
+        let was_silent = self.silent_replace_text;
+        self.cancel_linked_editing(cx);
+        self.secondary_selections.clear();
+        self.multi_cursor_editing = true;
+        self.silent_replace_text = true;
+        self.start_undo_transaction();
+        let history_version = self.history.version();
+
+        for (range, text) in edits.into_iter().rev() {
+            for selection in &mut after {
+                *selection =
+                    Self::transform_selection_after_external_edit(*selection, &range, text.len());
+            }
+            let range_utf16 = self.range_to_utf16(&range);
+            EntityInputHandler::replace_text_in_range(self, Some(range_utf16), &text, window, cx);
+        }
+
+        self.end_undo_transaction();
+        self.multi_cursor_editing = false;
+        self.silent_replace_text = was_silent;
+        self.set_editor_selections_internal(after);
+        self.update_preferred_column();
+        self.scroll_to(self.cursor(), None, cx);
+        self.refresh_bracket_match();
+
+        let after = self.selections();
+        if before != after {
+            self.multi_cursor_history
+                .insert(history_version, MultiCursorHistoryEntry { before, after });
+            while self.multi_cursor_history.len() > 1_000 {
+                if let Some(version) = self.multi_cursor_history.keys().next().copied() {
+                    self.multi_cursor_history.remove(&version);
+                }
+            }
+        }
+        if self.emit_events {
+            cx.emit(InputEvent::Change);
+            cx.emit(InputEvent::SelectionChange);
+        }
+        cx.notify();
+        true
+    }
+
     fn apply_cursor_edits(
         &mut self,
         mut edits: Vec<CursorEdit>,
@@ -1274,6 +1385,54 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![2, 5]
             );
+        });
+    }
+
+    #[gpui::test]
+    fn provider_buffer_edits_preserve_selections_and_undo_as_one_change(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("aa\nbb", window, cx);
+                state.set_editor_selections(
+                    [EditorSelection::caret(2), EditorSelection::caret(5)],
+                    cx,
+                );
+                assert!(state.apply_buffer_edits(
+                    vec![(0..0, ">".to_string()), (3..5, "B".to_string())],
+                    window,
+                    cx,
+                ));
+                assert_eq!(state.value(), ">aa\nB");
+                assert_eq!(
+                    state
+                        .selections()
+                        .into_iter()
+                        .map(|selection| selection.head())
+                        .collect::<Vec<_>>(),
+                    vec![3, 5]
+                );
+                assert!(state.is_dirty());
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.undo(&Undo, window, cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "aa\nbb");
+            assert_eq!(
+                state
+                    .selections()
+                    .into_iter()
+                    .map(|selection| selection.head())
+                    .collect::<Vec<_>>(),
+                vec![2, 5]
+            );
+            assert!(!state.is_dirty());
         });
     }
 

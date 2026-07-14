@@ -438,6 +438,11 @@ pub struct InputState {
     /// persisted text.
     saved_text: Rope,
     dirty: bool,
+    /// The latest direct user text insertion that produced the current change
+    /// event. Silent/programmatic edits, paste, completion, deletion, and
+    /// undo/redo clear this value so hosts can implement true on-type behavior
+    /// without inferring it from arbitrary buffer changes.
+    last_typed_text: Option<SharedString>,
     pub(super) display_map: DisplayMap,
     pub(super) history: History<Change>,
     pub(super) blink_cursor: Entity<BlinkCursor>,
@@ -607,6 +612,7 @@ impl InputState {
             text: "".into(),
             saved_text: "".into(),
             dirty: false,
+            last_typed_text: None,
             display_map: DisplayMap::new(text_style.font(), window.rem_size(), None),
             blink_cursor,
             history,
@@ -1432,6 +1438,15 @@ impl InputState {
     /// point. Undoing back to that exact text clears the dirty state.
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Return the direct text typed by the user for the latest change event.
+    ///
+    /// This is intentionally absent for paste and host-driven changes. Hosts
+    /// can inspect the last character to gate language-server on-type
+    /// formatting against the server's advertised trigger characters.
+    pub fn last_typed_text(&self) -> Option<&str> {
+        self.last_typed_text.as_deref()
     }
 
     /// Accept the current text as persisted without clearing undo history.
@@ -3460,6 +3475,11 @@ impl EntityInputHandler for InputState {
             return;
         }
 
+        self.last_typed_text = None;
+        let direct_typed_text =
+            (!self.silent_replace_text && !self.completion_inserting && !new_text.is_empty())
+                .then(|| SharedString::from(new_text.to_string()));
+
         let targets_primary_selection = range_utf16.as_ref().is_some_and(|range_utf16| {
             self.range_from_utf16(range_utf16) == Range::<usize>::from(self.selected_range)
         });
@@ -3635,6 +3655,7 @@ impl EntityInputHandler for InputState {
             self.end_undo_transaction();
         }
         self.dirty = self.text != self.saved_text;
+        self.last_typed_text = direct_typed_text;
         if !self.multi_cursor_editing {
             self.handle_signature_help_text_change(!self.silent_replace_text, cx);
             if !self.silent_replace_text {
@@ -5532,6 +5553,27 @@ ORDER BY id
                 state.redo(&Redo, window, cx);
                 assert_eq!(state.value(), "second");
                 assert!(!state.is_dirty());
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn last_typed_text_excludes_silent_and_programmatic_changes(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha", window, cx);
+                EntityInputHandler::replace_text_in_range(state, None, ";", window, cx);
+                assert_eq!(state.last_typed_text(), Some(";"));
+
+                state.replace("host", window, cx);
+                assert_eq!(state.last_typed_text(), None);
+
+                state.undo(&Undo, window, cx);
+                assert_eq!(state.last_typed_text(), None);
             });
         });
     }
