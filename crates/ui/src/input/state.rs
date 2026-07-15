@@ -4228,9 +4228,83 @@ mod tests {
             input.update(cx, |state, cx| {
                 assert!(state.show_hover_at_cursor(window, cx));
                 assert_eq!(calls.get(), 1, "the visible cursor hover is reused");
-                state.escape(&Escape, window, cx);
+                assert!(state.focus_hover_popover(window, cx));
+                assert!(state.hover_popover_is_focused(window, cx));
+            });
+        });
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
                 assert!(state.hover_popover_snapshot(cx).is_none());
+                assert!(state.focus_handle.is_focused(window));
                 assert!(!state.hide_hover_popover(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn focused_hover_owns_keyboard_scrolling_without_moving_the_editor_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(crate::global_state::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha beta", window, cx);
+                state.set_cursor_position(LspPosition::new(0, 2), window, cx);
+                let contents = (0..100)
+                    .map(|line| format!("hover documentation line {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                let hover = Hover {
+                    contents: HoverContents::Markup(lsp_types::MarkupContent {
+                        kind: lsp_types::MarkupKind::Markdown,
+                        value: contents,
+                    }),
+                    range: None,
+                };
+                state.hover_popover = Some(HoverPopover::new(cx.entity(), 0..5, &hover, cx));
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.focus_hover_popover(window, cx));
+                assert!(state.hover_popover_is_focused(window, cx));
+                let snapshot = state.hover_popover_snapshot(cx).unwrap();
+                assert_eq!(snapshot.scroll_offset_y, 0.);
+                assert!(snapshot.max_scroll_offset_y > 0.);
+            });
+        });
+
+        cx.simulate_keystrokes("down pagedown end");
+        input.read_with(&cx, |state, cx| {
+            let snapshot = state.hover_popover_snapshot(cx).unwrap();
+            assert_eq!(snapshot.scroll_offset_y, snapshot.max_scroll_offset_y);
+            assert_eq!(state.cursor_position(), LspPosition::new(0, 2));
+        });
+
+        cx.simulate_keystrokes("home");
+        input.read_with(&cx, |state, cx| {
+            assert_eq!(
+                state.hover_popover_snapshot(cx).unwrap().scroll_offset_y,
+                0.
+            );
+            assert_eq!(state.cursor_position(), LspPosition::new(0, 2));
+        });
+
+        cx.simulate_keystrokes("escape");
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.hover_popover_snapshot(cx).is_none());
+                assert!(state.focus_handle.is_focused(window));
             });
         });
     }

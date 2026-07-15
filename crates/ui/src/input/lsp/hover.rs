@@ -26,6 +26,18 @@ pub trait HoverProvider {
 pub struct HoverPopoverSnapshot {
     pub symbol_range: Range<usize>,
     pub hover: lsp_types::Hover,
+    pub scroll_offset_y: f32,
+    pub max_scroll_offset_y: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoverPopoverScroll {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
 }
 
 impl InputState {
@@ -71,12 +83,53 @@ impl InputState {
         was_visible
     }
 
+    /// Focus a visible hover so its contents own keyboard navigation.
+    pub fn focus_hover_popover(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<InputState>,
+    ) -> bool {
+        let Some(popover) = self.hover_popover.as_ref() else {
+            return false;
+        };
+        let focus_handle = popover.read(cx).focus_handle();
+        focus_handle.focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Whether the visible hover currently owns keyboard focus.
+    pub fn hover_popover_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.hover_popover
+            .as_ref()
+            .is_some_and(|popover| popover.read(cx).is_focused(window))
+    }
+
+    /// Move a visible hover's scroll position without moving the editor cursor.
+    pub fn scroll_hover_popover(
+        &mut self,
+        command: HoverPopoverScroll,
+        cx: &mut Context<InputState>,
+    ) -> bool {
+        let Some(popover) = self.hover_popover.as_ref() else {
+            return false;
+        };
+        let changed = popover.read(cx).scroll(command);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
     /// Return the currently rendered hover range and protocol payload.
     pub fn hover_popover_snapshot(&self, cx: &App) -> Option<HoverPopoverSnapshot> {
         let popover = self.hover_popover.as_ref()?.read(cx);
+        let (scroll_offset_y, max_scroll_offset_y) = popover.scroll_offsets();
         Some(HoverPopoverSnapshot {
             symbol_range: popover.symbol_range.clone(),
             hover: popover.hover.as_ref().clone(),
+            scroll_offset_y,
+            max_scroll_offset_y,
         })
     }
 
