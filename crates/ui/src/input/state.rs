@@ -4107,7 +4107,7 @@ mod tests {
     use super::*;
     use crate::input::{
         CodeActionProvider, CodeActionTrigger, CodeLensProvider, DocumentLinkProvider,
-        EditorAutoClosingPair, EditorLanguageConfiguration, EditorTokenContext,
+        EditorAutoClosingPair, EditorLanguageConfiguration, EditorTokenContext, HoverProvider,
         LinkedEditingRangeProvider, SignatureHelpProvider,
     };
     use crate::theme::Theme;
@@ -4188,6 +4188,50 @@ mod tests {
     }
 
     #[gpui::test]
+    fn keyboard_hover_requests_immediately_and_exposes_a_public_snapshot(cx: &mut TestAppContext) {
+        cx.update(crate::global_state::init);
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+        let calls = Rc::new(Cell::new(0));
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha beta", window, cx);
+                state.lsp.hover_provider = Some(Rc::new(StaticHoverProvider {
+                    calls: calls.clone(),
+                }));
+                state.set_cursor_position(LspPosition::new(0, 2), window, cx);
+                assert!(state.show_hover_at_cursor(window, cx));
+                assert!(state.hover_popover_snapshot(cx).is_none());
+            });
+        });
+        cx.run_until_parked();
+
+        input.read_with(&cx, |state, cx| {
+            let snapshot = state
+                .hover_popover_snapshot(cx)
+                .expect("keyboard hover should be visible without advancing the delay clock");
+            assert_eq!(snapshot.symbol_range, 0..5);
+            assert_eq!(
+                snapshot.hover.contents,
+                HoverContents::Scalar(MarkedString::String("keyboard hover".to_string()))
+            );
+        });
+        assert_eq!(calls.get(), 1);
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                assert!(state.show_hover_at_cursor(window, cx));
+                assert_eq!(calls.get(), 1, "the visible cursor hover is reused");
+                assert!(state.hide_hover_popover(cx));
+                assert!(state.hover_popover_snapshot(cx).is_none());
+                assert!(!state.hide_hover_popover(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn secondary_enter_submits_multi_line_input_without_inserting_text(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state.auto_grow(1, 5));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
@@ -4254,8 +4298,31 @@ mod tests {
 
     struct StaticLinkedEditingProvider;
 
+    struct StaticHoverProvider {
+        calls: Rc<Cell<usize>>,
+    }
+
     struct StaticCodeActionProvider {
         triggers: Rc<RefCell<Vec<CodeActionTrigger>>>,
+    }
+
+    impl HoverProvider for StaticHoverProvider {
+        fn hover(
+            &self,
+            _text: &Rope,
+            _offset: usize,
+            _window: &mut Window,
+            _cx: &mut App,
+        ) -> Task<anyhow::Result<Option<Hover>>> {
+            self.calls.set(self.calls.get() + 1);
+            Task::ready(Ok(Some(Hover {
+                contents: HoverContents::Scalar(MarkedString::String("keyboard hover".to_string())),
+                range: Some(LspRange::new(
+                    LspPosition::new(0, 0),
+                    LspPosition::new(0, 5),
+                )),
+            })))
+        }
     }
 
     impl CodeActionProvider for StaticCodeActionProvider {
