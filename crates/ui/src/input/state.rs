@@ -4284,7 +4284,7 @@ mod tests {
             });
         });
 
-        cx.simulate_keystrokes("down pagedown end");
+        cx.simulate_keystrokes("left right down pagedown end");
         input.read_with(&cx, |state, cx| {
             let snapshot = state.hover_popover_snapshot(cx).unwrap();
             assert_eq!(snapshot.scroll_offset_y, snapshot.max_scroll_offset_y);

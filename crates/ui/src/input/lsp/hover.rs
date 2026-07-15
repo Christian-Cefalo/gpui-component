@@ -26,12 +26,16 @@ pub trait HoverProvider {
 pub struct HoverPopoverSnapshot {
     pub symbol_range: Range<usize>,
     pub hover: lsp_types::Hover,
+    pub scroll_offset_x: f32,
     pub scroll_offset_y: f32,
+    pub max_scroll_offset_x: f32,
     pub max_scroll_offset_y: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HoverPopoverScroll {
+    LineLeft,
+    LineRight,
     LineUp,
     LineDown,
     PageUp,
@@ -124,11 +128,14 @@ impl InputState {
     /// Return the currently rendered hover range and protocol payload.
     pub fn hover_popover_snapshot(&self, cx: &App) -> Option<HoverPopoverSnapshot> {
         let popover = self.hover_popover.as_ref()?.read(cx);
-        let (scroll_offset_y, max_scroll_offset_y) = popover.scroll_offsets();
+        let (scroll_offset_x, scroll_offset_y, max_scroll_offset_x, max_scroll_offset_y) =
+            popover.scroll_offsets();
         Some(HoverPopoverSnapshot {
             symbol_range: popover.symbol_range.clone(),
             hover: popover.hover.as_ref().clone(),
+            scroll_offset_x,
             scroll_offset_y,
+            max_scroll_offset_x,
             max_scroll_offset_y,
         })
     }

@@ -55,9 +55,11 @@ impl HoverPopover {
         scroll_hover_handle(&self.scroll_handle, command)
     }
 
-    pub(crate) fn scroll_offsets(&self) -> (f32, f32) {
+    pub(crate) fn scroll_offsets(&self) -> (f32, f32, f32, f32) {
         (
+            -self.scroll_handle.offset().x.as_f32(),
             -self.scroll_handle.offset().y.as_f32(),
+            self.scroll_handle.max_offset().x.as_f32(),
             self.scroll_handle.max_offset().y.as_f32(),
         )
     }
@@ -259,7 +261,7 @@ impl Element for Popover {
             .shadow_md()
             .max_w(max_width)
             .max_h(max_height)
-            .overflow_y_scroll()
+            .overflow_scroll()
             .refine_style(&self.style);
         if let Some(navigation) = self.keyboard_navigation.as_ref() {
             let focus_handle = navigation.focus_handle.clone();
@@ -392,7 +394,21 @@ fn scroll_hover_handle(scroll_handle: &ScrollHandle, command: HoverPopoverScroll
     let old_offset = scroll_handle.offset();
     let max_offset = scroll_handle.max_offset();
     let viewport_height = scroll_handle.bounds().size.height.max(px(18.));
+    if matches!(
+        command,
+        HoverPopoverScroll::LineLeft | HoverPopoverScroll::LineRight
+    ) {
+        let delta = match command {
+            HoverPopoverScroll::LineLeft => px(-40.),
+            HoverPopoverScroll::LineRight => px(40.),
+            _ => unreachable!(),
+        };
+        let next_x = (old_offset.x - delta).clamp(-max_offset.x, px(0.));
+        scroll_handle.set_offset(point(next_x, old_offset.y));
+        return next_x != old_offset.x;
+    }
     let delta = match command {
+        HoverPopoverScroll::LineLeft | HoverPopoverScroll::LineRight => unreachable!(),
         HoverPopoverScroll::LineUp => px(-18.),
         HoverPopoverScroll::LineDown => px(18.),
         HoverPopoverScroll::PageUp => -viewport_height,
@@ -430,6 +446,8 @@ fn handle_hover_key_down(
         "down" if modifiers.secondary() => Some(HoverPopoverScroll::Bottom),
         "up" if modifiers.alt => Some(HoverPopoverScroll::PageUp),
         "down" if modifiers.alt => Some(HoverPopoverScroll::PageDown),
+        "left" => Some(HoverPopoverScroll::LineLeft),
+        "right" => Some(HoverPopoverScroll::LineRight),
         "up" => Some(HoverPopoverScroll::LineUp),
         "down" => Some(HoverPopoverScroll::LineDown),
         "pageup" => Some(HoverPopoverScroll::PageUp),
