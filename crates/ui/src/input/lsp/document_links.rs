@@ -5,16 +5,20 @@ use gpui::{
     App, Context, HighlightStyle, Hitbox, MouseDownEvent, Task, UnderlineStyle, Window, px,
 };
 use instant::Duration;
-use lsp_types::DocumentLink;
+use lsp_types::{DocumentLink, Hover, HoverContents, MarkedString};
 use ropey::Rope;
 
 use crate::{
     highlighter::HighlightTheme,
-    input::{InputState, Lsp, OpenDocumentLink, RopeExt as _, element::TextElement},
+    input::{
+        InputState, Lsp, OpenDocumentLink, RopeExt as _, element::TextElement,
+        popovers::HoverPopover,
+    },
 };
 
 const DOCUMENT_LINK_DEBOUNCE: Duration = Duration::from_millis(1_000);
 const MAX_DOCUMENT_LINKS: usize = 2_000;
+const MAX_DOCUMENT_LINK_TOOLTIP_BYTES: usize = 4_096;
 
 /// Supplies, resolves, and activates LSP document links.
 ///
@@ -84,18 +88,53 @@ fn byte_range(text: &Rope, link: &DocumentLink) -> ByteRange<usize> {
     text.position_to_offset(&link.range.start)..text.position_to_offset(&link.range.end)
 }
 
+fn document_link_hover(link: &DocumentLink) -> Hover {
+    let label = link
+        .tooltip
+        .as_deref()
+        .map(str::trim)
+        .filter(|tooltip| !tooltip.is_empty())
+        .unwrap_or_else(|| {
+            if link.target.is_some() {
+                "Follow link"
+            } else {
+                "Resolve and follow link"
+            }
+        });
+    let mut tooltip = format!("{label}\n\nModifier-click to follow link.");
+    if tooltip.len() > MAX_DOCUMENT_LINK_TOOLTIP_BYTES {
+        let mut end = MAX_DOCUMENT_LINK_TOOLTIP_BYTES.saturating_sub('…'.len_utf8());
+        while !tooltip.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        tooltip.truncate(end);
+        tooltip.push('…');
+    }
+
+    Hover {
+        contents: HoverContents::Scalar(MarkedString::String(tooltip)),
+        range: Some(link.range),
+    }
+}
+
 impl Lsp {
     pub(crate) fn invalidate_document_links(&mut self) {
         self.document_link_generation = self.document_link_generation.wrapping_add(1);
         self.document_link_requested_generation = None;
         self.document_links.clear();
         self.active_document_link = None;
+        self.document_link_tooltip_visible = false;
         self._document_link_task = Task::ready(());
         self._document_link_resolve_task = Task::ready(Ok(()));
     }
 
     pub fn document_links(&self) -> &[DocumentLink] {
         &self.document_links
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_active_document_link(&self) -> bool {
+        self.active_document_link.is_some()
     }
 
     pub(crate) fn document_link_at_offset(
@@ -108,6 +147,7 @@ impl Lsp {
             .find(|link| byte_range(text, link).contains(&offset))
     }
 
+    #[cfg(test)]
     pub(crate) fn set_active_document_link_at(&mut self, text: &Rope, offset: usize) -> bool {
         let next = self.document_link_at_offset(text, offset).cloned();
         let changed = self.active_document_link != next;
@@ -207,10 +247,33 @@ impl InputState {
             .is_some()
     }
 
-    pub(crate) fn handle_hover_document_link(&mut self, offset: usize) -> bool {
+    pub(crate) fn handle_hover_document_link(
+        &mut self,
+        offset: usize,
+        activate: bool,
+        cx: &mut Context<InputState>,
+    ) -> bool {
         let text = self.text.clone();
-        self.lsp.set_active_document_link_at(&text, offset);
-        self.lsp.active_document_link.is_some()
+        let link = self.lsp.document_link_at_offset(&text, offset).cloned();
+        self.lsp.active_document_link = if activate { link.clone() } else { None };
+        let Some(link) = link else {
+            if std::mem::take(&mut self.lsp.document_link_tooltip_visible) {
+                self.hover_popover = None;
+            }
+            return false;
+        };
+
+        self.lsp._hover_task = Task::ready(Ok(()));
+        self.lsp.document_link_tooltip_visible = true;
+        let hover = document_link_hover(&link);
+        self.hover_popover = Some(HoverPopover::new(
+            cx.entity(),
+            byte_range(&self.text, &link),
+            &hover,
+            cx,
+        ));
+        cx.notify();
+        true
     }
 
     pub(crate) fn clear_active_document_link(&mut self) -> bool {
@@ -434,5 +497,27 @@ mod tests {
         assert_eq!(lsp.active_document_link, Some(link(6, 10, None)));
         assert!(lsp.clear_active_document_link());
         assert!(!lsp.clear_active_document_link());
+    }
+
+    #[test]
+    fn link_hover_prefers_server_tooltip_and_is_bounded() {
+        let mut documented = link(0, 5, Some("https://example.com"));
+        documented.tooltip = Some("Open the documentation".to_string());
+        let HoverContents::Scalar(MarkedString::String(tooltip)) =
+            document_link_hover(&documented).contents
+        else {
+            panic!("document-link hover should use a plain marked string");
+        };
+        assert!(tooltip.starts_with("Open the documentation"));
+        assert!(tooltip.contains("Modifier-click"));
+
+        documented.tooltip = Some("x".repeat(MAX_DOCUMENT_LINK_TOOLTIP_BYTES * 2));
+        let HoverContents::Scalar(MarkedString::String(tooltip)) =
+            document_link_hover(&documented).contents
+        else {
+            panic!("document-link hover should use a plain marked string");
+        };
+        assert!(tooltip.len() <= MAX_DOCUMENT_LINK_TOOLTIP_BYTES);
+        assert!(tooltip.ends_with('…'));
     }
 }

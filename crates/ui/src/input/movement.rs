@@ -232,6 +232,10 @@ impl InputState {
         };
 
         let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
+        if self.has_multiple_selections() {
+            self.move_all_cursors_vertical(-display_lines, cx);
+            return;
+        }
         self.move_vertical(-display_lines, window, cx);
     }
 
@@ -250,6 +254,10 @@ impl InputState {
         };
 
         let display_lines = (self.input_bounds.size.height / last_layout.line_height) as isize;
+        if self.has_multiple_selections() {
+            self.move_all_cursors_vertical(display_lines, cx);
+            return;
+        }
         self.move_vertical(display_lines, window, cx);
     }
 

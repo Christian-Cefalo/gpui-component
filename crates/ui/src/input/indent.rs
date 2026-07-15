@@ -1,16 +1,24 @@
+use std::{collections::BTreeMap, ops::Range};
+
 use gpui::{
-    Bounds, Context, EntityInputHandler as _, Hsla, Path, PathBuilder, Pixels, SharedString,
-    TextRun, TextStyle, Window, point, px,
+    Bounds, Context, Hsla, Path, PathBuilder, Pixels, SharedString, TextRun, TextStyle, Window,
+    point, px,
 };
 use ropey::RopeSlice;
 
 use crate::{
     RopeExt,
     input::{
-        Indent, IndentInline, InputState, LastLayout, Outdent, OutdentInline, element::TextElement,
-        mode::InputMode,
+        EditorSelection, Indent, IndentInline, InputState, LastLayout, Outdent, OutdentInline,
+        Rope, Selection, comment::selection_line_range, element::TextElement, mode::InputMode,
     },
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IndentPlan {
+    edits: Vec<(Range<usize>, String)>,
+    selections_after: Vec<EditorSelection>,
+}
 
 #[derive(Debug, Copy, Clone)]
 pub struct TabSize {
@@ -274,133 +282,201 @@ impl InputState {
         if !self.mode.is_indentable() {
             cx.propagate();
             return;
-        };
-
-        let tab_indent = self.mode.tab_size().to_string();
-        let selected_range = self.selected_range;
-        let mut added_len = 0;
-        let is_selected = !self.selected_range.is_empty();
-
-        if is_selected || block {
-            let start_offset = self.start_of_line_of_selection(window, cx);
-            let mut offset = start_offset;
-
-            let selected_text = self
-                .text_for_range(
-                    self.range_to_utf16(&(offset..selected_range.end)),
-                    &mut None,
-                    window,
-                    cx,
-                )
-                .unwrap_or("".into());
-
-            for line in selected_text.split('\n') {
-                self.replace_text_in_range_silent(
-                    Some(self.range_to_utf16(&(offset..offset))),
-                    &tab_indent,
-                    window,
-                    cx,
-                );
-                added_len += tab_indent.len();
-                // +1 for "\n", the `\r` is included in the `line`.
-                offset += line.len() + tab_indent.len() + 1;
-            }
-
-            if is_selected {
-                self.selected_range = (start_offset..selected_range.end + added_len).into();
-            } else {
-                self.selected_range =
-                    (selected_range.start + added_len..selected_range.end + added_len).into();
-            }
-        } else {
-            // Selected none
-            let offset = self.selected_range.start;
-            self.replace_text_in_range_silent(
-                Some(self.range_to_utf16(&(offset..offset))),
-                &tab_indent,
-                window,
-                cx,
-            );
-            added_len = tab_indent.len();
-
-            self.selected_range =
-                (selected_range.start + added_len..selected_range.end + added_len).into();
         }
+        let Some(plan) = plan_indent(&self.text, &self.selections(), self.mode.tab_size(), block)
+        else {
+            return;
+        };
+        self.apply_buffer_edits_with_selections(plan.edits, plan.selections_after, window, cx);
     }
 
     pub(super) fn outdent(&mut self, block: bool, window: &mut Window, cx: &mut Context<Self>) {
         if !self.mode.is_indentable() {
             cx.propagate();
             return;
+        }
+        let Some(plan) = plan_outdent(&self.text, &self.selections(), self.mode.tab_size(), block)
+        else {
+            return;
         };
+        self.apply_buffer_edits_with_selections(plan.edits, plan.selections_after, window, cx);
+    }
+}
 
-        let tab_indent = self.mode.tab_size().to_string();
-        let selected_range = self.selected_range;
-        let mut removed_len = 0;
-        let is_selected = !self.selected_range.is_empty();
-
-        if is_selected || block {
-            let start_offset = self.start_of_line_of_selection(window, cx);
-            let mut offset = start_offset;
-
-            let selected_text = self
-                .text_for_range(
-                    self.range_to_utf16(&(offset..selected_range.end)),
-                    &mut None,
-                    window,
-                    cx,
-                )
-                .unwrap_or("".into());
-
-            for line in selected_text.split('\n') {
-                if line.starts_with(tab_indent.as_ref()) {
-                    self.replace_text_in_range_silent(
-                        Some(self.range_to_utf16(&(offset..offset + tab_indent.len()))),
-                        "",
-                        window,
-                        cx,
-                    );
-                    removed_len += tab_indent.len();
-
-                    // +1 for "\n"
-                    offset += line.len().saturating_sub(tab_indent.len()) + 1;
-                } else {
-                    offset += line.len() + 1;
-                }
-            }
-
-            if is_selected {
-                self.selected_range =
-                    (start_offset..selected_range.end.saturating_sub(removed_len)).into();
-            } else {
-                self.selected_range = (selected_range.start.saturating_sub(removed_len)
-                    ..selected_range.end.saturating_sub(removed_len))
-                    .into();
+fn plan_indent(
+    text: &Rope,
+    selections: &[EditorSelection],
+    tab: TabSize,
+    block: bool,
+) -> Option<IndentPlan> {
+    if selections.is_empty() || text.lines_len() == 0 {
+        return None;
+    }
+    let mut line_edits = BTreeMap::<usize, bool>::new();
+    let mut inline_offsets = Vec::new();
+    for selection in selections {
+        if block || !selection.is_empty() {
+            let rows = selection_line_range(text, *selection)?;
+            let single_line = rows.start() == rows.end();
+            for row in rows {
+                line_edits
+                    .entry(row)
+                    .and_modify(|indent_empty| *indent_empty |= single_line)
+                    .or_insert(single_line);
             }
         } else {
-            // Selected none
-            let start_offset = self.selected_range.start;
-            let offset = self.start_of_line_of_selection(window, cx);
-            let offset = self.offset_from_utf16(self.offset_to_utf16(offset));
-            // FIXME: To improve performance
-            if self
-                .text
-                .slice(offset..self.text.len())
-                .to_string()
-                .starts_with(tab_indent.as_ref())
-            {
-                self.replace_text_in_range_silent(
-                    Some(self.range_to_utf16(&(offset..offset + tab_indent.len()))),
-                    "",
-                    window,
-                    cx,
-                );
-                removed_len = tab_indent.len();
-                let new_offset = start_offset.saturating_sub(removed_len);
-                self.selected_range = (new_offset..new_offset).into();
-            }
+            inline_offsets.push(selection.head());
         }
     }
+
+    let mut edits = BTreeMap::<(usize, usize), String>::new();
+    let indent = tab.to_string().to_string();
+    for (row, indent_empty) in line_edits {
+        let content = line_content(text, row);
+        if content.is_empty() && !indent_empty {
+            continue;
+        }
+        let offset = text.line_start_offset(row);
+        edits.insert((offset, offset), indent.clone());
+    }
+    for offset in inline_offsets {
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            return None;
+        }
+        let insertion = inline_tab_text(text, offset, tab);
+        edits.entry((offset, offset)).or_insert(insertion);
+    }
+    finish_indent_plan(selections, edits)
+}
+
+fn plan_outdent(
+    text: &Rope,
+    selections: &[EditorSelection],
+    tab: TabSize,
+    _block: bool,
+) -> Option<IndentPlan> {
+    if selections.is_empty() || text.lines_len() == 0 {
+        return None;
+    }
+    let mut rows = BTreeMap::<usize, ()>::new();
+    for selection in selections {
+        for row in selection_line_range(text, *selection)? {
+            rows.insert(row, ());
+        }
+    }
+    let mut edits = BTreeMap::<(usize, usize), String>::new();
+    for row in rows.into_keys() {
+        let content = line_content(text, row);
+        let remove = outdent_prefix_len(&content, tab.tab_size.max(1));
+        if remove == 0 {
+            continue;
+        }
+        let start = text.line_start_offset(row);
+        edits.insert((start, start + remove), String::new());
+    }
+    finish_indent_plan(selections, edits)
+}
+
+fn finish_indent_plan(
+    selections: &[EditorSelection],
+    edits: BTreeMap<(usize, usize), String>,
+) -> Option<IndentPlan> {
+    if edits.is_empty() {
+        return None;
+    }
+    let edits = edits
+        .into_iter()
+        .map(|((start, end), replacement)| (start..end, replacement))
+        .collect::<Vec<_>>();
+    let selections_after = selections
+        .iter()
+        .copied()
+        .map(|selection| transform_selection_for_indent(selection, &edits))
+        .collect();
+    Some(IndentPlan {
+        edits,
+        selections_after,
+    })
+}
+
+fn transform_selection_for_indent(
+    selection: EditorSelection,
+    edits: &[(Range<usize>, String)],
+) -> EditorSelection {
+    let start = transform_indent_offset(selection.range.start, selection.is_empty(), edits);
+    let end = transform_indent_offset(selection.range.end, selection.is_empty(), edits);
+    EditorSelection {
+        range: Selection::new(start.min(end), start.max(end)),
+        reversed: selection.reversed,
+    }
+}
+
+fn transform_indent_offset(
+    offset: usize,
+    move_after_equal_insertion: bool,
+    edits: &[(Range<usize>, String)],
+) -> usize {
+    let mut delta = 0isize;
+    for (range, replacement) in edits {
+        if offset < range.start {
+            break;
+        }
+        if range.is_empty() {
+            if offset > range.start || (offset == range.start && move_after_equal_insertion) {
+                delta += replacement.len() as isize;
+            }
+            continue;
+        }
+        if offset == range.start {
+            return range.start.saturating_add_signed(delta);
+        }
+        if offset < range.end {
+            return range
+                .start
+                .saturating_add_signed(delta)
+                .saturating_add((offset - range.start).min(replacement.len()));
+        }
+        delta += replacement.len() as isize - range.len() as isize;
+    }
+    offset.saturating_add_signed(delta)
+}
+
+fn line_content(text: &Rope, row: usize) -> String {
+    let mut content = text.slice_line(row).to_string();
+    if content.ends_with('\r') {
+        content.pop();
+    }
+    content
+}
+
+fn inline_tab_text(text: &Rope, offset: usize, tab: TabSize) -> String {
+    if tab.hard_tabs {
+        return "\t".to_string();
+    }
+    let tab_size = tab.tab_size.max(1);
+    let row = text.offset_to_point(offset).row;
+    let line_start = text.line_start_offset(row);
+    let prefix = text.slice(line_start..offset).to_string();
+    let column = prefix.chars().fold(0usize, |column, character| {
+        if character == '\t' {
+            column + (tab_size - column % tab_size)
+        } else {
+            column + 1
+        }
+    });
+    " ".repeat(tab_size - column % tab_size)
+}
+
+fn outdent_prefix_len(content: &str, tab_size: usize) -> usize {
+    if content.starts_with('\t') {
+        return 1;
+    }
+    content
+        .as_bytes()
+        .iter()
+        .take(tab_size)
+        .take_while(|byte| **byte == b' ')
+        .count()
 }
 
 fn update_tab_size(mode: &mut InputMode, tab: TabSize) -> bool {
@@ -417,8 +493,16 @@ fn update_tab_size(mode: &mut InputMode, tab: TabSize) -> bool {
 mod tests {
     use ropey::RopeSlice;
 
-    use super::{TabSize, update_tab_size};
-    use crate::input::mode::InputMode;
+    use super::{IndentPlan, TabSize, plan_indent, plan_outdent, update_tab_size};
+    use crate::input::{EditorSelection, Rope, mode::InputMode};
+
+    fn apply_plan(source: &str, plan: &IndentPlan) -> String {
+        let mut result = source.to_string();
+        for (range, replacement) in plan.edits.iter().rev() {
+            result.replace_range(range.clone(), replacement);
+        }
+        result
+    }
 
     #[test]
     fn test_tab_size() {
@@ -472,5 +556,90 @@ mod tests {
         ));
         assert_eq!(mode.tab_size().tab_size, 4);
         assert!(mode.tab_size().hard_tabs);
+    }
+
+    #[test]
+    fn inline_tab_advances_every_unicode_cursor_to_the_next_visual_tab_stop() {
+        let source = "α\tb\n12345\n";
+        let first = "α".len();
+        let second = source.find("12345").unwrap() + 5;
+        let selections = vec![
+            EditorSelection::caret(first),
+            EditorSelection::caret(second),
+        ];
+        let plan = plan_indent(
+            &Rope::from(source),
+            &selections,
+            TabSize {
+                tab_size: 4,
+                hard_tabs: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(apply_plan(source, &plan), "α   \tb\n12345   \n");
+        assert_eq!(
+            plan.selections_after,
+            vec![
+                EditorSelection::caret(first + 3),
+                EditorSelection::caret(second + 6),
+            ]
+        );
+    }
+
+    #[test]
+    fn block_indent_deduplicates_lines_and_excludes_a_selection_end_at_next_line_start() {
+        let source = "a\r\n\r\nb\r\n";
+        let third_line = source.find('b').unwrap();
+        let selections = vec![
+            EditorSelection::from_anchor_and_head(0, third_line),
+            EditorSelection::caret(third_line),
+        ];
+        let plan = plan_indent(
+            &Rope::from(source),
+            &selections,
+            TabSize {
+                tab_size: 2,
+                hard_tabs: false,
+            },
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(apply_plan(source, &plan), "  a\r\n\r\n  b\r\n");
+        assert_eq!(plan.selections_after[0].range.start, 0);
+        assert_eq!(plan.selections_after[0].range.end, third_line + 2);
+        assert_eq!(
+            plan.selections_after[1],
+            EditorSelection::caret(third_line + 4)
+        );
+    }
+
+    #[test]
+    fn outdent_handles_spaces_tabs_crlf_and_preserves_reversed_selections() {
+        let source = "    one\r\n\ttwo\n  three";
+        let second = source.find("two").unwrap();
+        let third = source.find("three").unwrap();
+        let selections = vec![
+            EditorSelection::caret(source.find("one").unwrap()),
+            EditorSelection::caret(second),
+            EditorSelection::from_anchor_and_head(source.len(), third),
+        ];
+        let plan = plan_outdent(
+            &Rope::from(source),
+            &selections,
+            TabSize {
+                tab_size: 4,
+                hard_tabs: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(apply_plan(source, &plan), "one\r\ntwo\nthree");
+        assert!(plan.selections_after[2].reversed);
+        assert_eq!(plan.selections_after[0], EditorSelection::caret(0));
+        assert_eq!(plan.selections_after[1], EditorSelection::caret(5));
     }
 }

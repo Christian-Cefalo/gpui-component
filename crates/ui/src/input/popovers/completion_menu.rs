@@ -8,7 +8,8 @@ use gpui::{
     div, prelude::FluentBuilder, px, relative,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionTextEdit, InsertTextFormat, InsertTextMode,
+    CompletionItem, CompletionItemKind, CompletionItemTag, CompletionTextEdit, InsertTextFormat,
+    InsertTextMode,
 };
 use ropey::{LineType, Rope};
 
@@ -277,6 +278,69 @@ fn completion_item_display_width(item: &CompletionItem) -> usize {
         + item.detail.as_ref().map_or(0, String::len)
 }
 
+fn completion_item_kind_label(kind: Option<CompletionItemKind>) -> &'static str {
+    let kind = kind.unwrap_or(CompletionItemKind::TEXT);
+    if kind == CompletionItemKind::METHOD {
+        "mth"
+    } else if kind == CompletionItemKind::FUNCTION {
+        "fn"
+    } else if kind == CompletionItemKind::CONSTRUCTOR {
+        "new"
+    } else if kind == CompletionItemKind::FIELD {
+        "fld"
+    } else if kind == CompletionItemKind::VARIABLE {
+        "var"
+    } else if kind == CompletionItemKind::CLASS {
+        "cls"
+    } else if kind == CompletionItemKind::INTERFACE {
+        "ifc"
+    } else if kind == CompletionItemKind::MODULE {
+        "mod"
+    } else if kind == CompletionItemKind::PROPERTY {
+        "prop"
+    } else if kind == CompletionItemKind::UNIT {
+        "unit"
+    } else if kind == CompletionItemKind::VALUE {
+        "val"
+    } else if kind == CompletionItemKind::ENUM {
+        "enum"
+    } else if kind == CompletionItemKind::KEYWORD {
+        "key"
+    } else if kind == CompletionItemKind::SNIPPET {
+        "snip"
+    } else if kind == CompletionItemKind::COLOR {
+        "clr"
+    } else if kind == CompletionItemKind::FILE {
+        "file"
+    } else if kind == CompletionItemKind::REFERENCE {
+        "ref"
+    } else if kind == CompletionItemKind::FOLDER {
+        "dir"
+    } else if kind == CompletionItemKind::ENUM_MEMBER {
+        "enm"
+    } else if kind == CompletionItemKind::CONSTANT {
+        "const"
+    } else if kind == CompletionItemKind::STRUCT {
+        "str"
+    } else if kind == CompletionItemKind::EVENT {
+        "evt"
+    } else if kind == CompletionItemKind::OPERATOR {
+        "op"
+    } else if kind == CompletionItemKind::TYPE_PARAMETER {
+        "type"
+    } else {
+        "txt"
+    }
+}
+
+fn completion_item_is_deprecated(item: &CompletionItem) -> bool {
+    item.deprecated.unwrap_or(false)
+        || item
+            .tags
+            .as_ref()
+            .is_some_and(|tags| tags.contains(&CompletionItemTag::DEPRECATED))
+}
+
 fn should_insert_commit_character(
     text: &Rope,
     cursor: usize,
@@ -356,7 +420,8 @@ impl RenderOnce for CompletionMenuItem {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let item = self.item;
 
-        let deprecated = item.deprecated.unwrap_or(false);
+        let deprecated = completion_item_is_deprecated(&item);
+        let kind_label = completion_item_kind_label(item.kind);
         let label_detail = item
             .label_details
             .as_ref()
@@ -366,22 +431,26 @@ impl RenderOnce for CompletionMenuItem {
             .as_ref()
             .and_then(|details| details.description.clone());
         let highlight_query = completion_query_fragment(&self.highlight_prefix);
-        let highlights = completion_match(highlight_query, &item.label)
-            .map(|(_, ranges)| {
-                ranges
-                    .into_iter()
-                    .map(|range| {
-                        (
-                            range,
-                            HighlightStyle {
-                                color: Some(cx.theme().blue),
-                                ..Default::default()
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let highlights = if deprecated {
+            Vec::new()
+        } else {
+            completion_match(highlight_query, &item.label)
+                .map(|(_, ranges)| {
+                    ranges
+                        .into_iter()
+                        .map(|range| {
+                            (
+                                range,
+                                HighlightStyle {
+                                    color: Some(cx.theme().blue),
+                                    ..Default::default()
+                                },
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
 
         h_flex()
             .id(self.ix)
@@ -390,12 +459,20 @@ impl RenderOnce for CompletionMenuItem {
             .text_xs()
             .line_height(relative(1.))
             .rounded(cx.theme().radius.half())
-            .when(item.deprecated.unwrap_or(false), |this| this.line_through())
+            .when(deprecated, |this| this.line_through())
             .hover(|this| this.bg(cx.theme().accent.opacity(0.8)))
             .when(self.selected, |this| {
                 this.bg(cx.theme().tokens.accent)
                     .text_color(cx.theme().accent_foreground)
             })
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .w(px(34.))
+                    .justify_center()
+                    .child(kind_label),
+            )
             .child(
                 h_flex()
                     .gap_0()
@@ -1769,6 +1846,64 @@ mod tests {
             completion_item_display_width(&item),
             "map(callback)Iteratorfn map<B>".len()
         );
+    }
+
+    #[test]
+    fn completion_deprecation_accepts_standard_tags_and_legacy_boolean() {
+        let current = CompletionItem {
+            label: "current".into(),
+            ..CompletionItem::default()
+        };
+        let legacy = CompletionItem {
+            label: "legacy".into(),
+            deprecated: Some(true),
+            ..CompletionItem::default()
+        };
+        let tagged = CompletionItem {
+            label: "tagged".into(),
+            tags: Some(vec![CompletionItemTag::DEPRECATED]),
+            ..CompletionItem::default()
+        };
+
+        assert!(!completion_item_is_deprecated(&current));
+        assert!(completion_item_is_deprecated(&legacy));
+        assert!(completion_item_is_deprecated(&tagged));
+    }
+
+    #[test]
+    fn completion_kind_labels_cover_the_standard_lsp_value_set() {
+        let labels = [
+            (CompletionItemKind::TEXT, "txt"),
+            (CompletionItemKind::METHOD, "mth"),
+            (CompletionItemKind::FUNCTION, "fn"),
+            (CompletionItemKind::CONSTRUCTOR, "new"),
+            (CompletionItemKind::FIELD, "fld"),
+            (CompletionItemKind::VARIABLE, "var"),
+            (CompletionItemKind::CLASS, "cls"),
+            (CompletionItemKind::INTERFACE, "ifc"),
+            (CompletionItemKind::MODULE, "mod"),
+            (CompletionItemKind::PROPERTY, "prop"),
+            (CompletionItemKind::UNIT, "unit"),
+            (CompletionItemKind::VALUE, "val"),
+            (CompletionItemKind::ENUM, "enum"),
+            (CompletionItemKind::KEYWORD, "key"),
+            (CompletionItemKind::SNIPPET, "snip"),
+            (CompletionItemKind::COLOR, "clr"),
+            (CompletionItemKind::FILE, "file"),
+            (CompletionItemKind::REFERENCE, "ref"),
+            (CompletionItemKind::FOLDER, "dir"),
+            (CompletionItemKind::ENUM_MEMBER, "enm"),
+            (CompletionItemKind::CONSTANT, "const"),
+            (CompletionItemKind::STRUCT, "str"),
+            (CompletionItemKind::EVENT, "evt"),
+            (CompletionItemKind::OPERATOR, "op"),
+            (CompletionItemKind::TYPE_PARAMETER, "type"),
+        ];
+
+        assert_eq!(completion_item_kind_label(None), "txt");
+        for (kind, expected) in labels {
+            assert_eq!(completion_item_kind_label(Some(kind)), expected);
+        }
     }
 
     #[test]

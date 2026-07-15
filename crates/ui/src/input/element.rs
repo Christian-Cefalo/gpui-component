@@ -19,7 +19,7 @@ use crate::{
     ActiveTheme as _, Colorize, IconName, Root, Selectable, Sizable as _,
     button::{Button, ButtonVariants as _},
     input::{
-        DisplayInlayHint, DisplayInlayHintPart, RopeExt as _,
+        DisplayInlayHint, RopeExt as _,
         blink_cursor::CURSOR_WIDTH,
         display_map::{InjectedTextSpan, LineLayout, VisualLineMapping},
     },
@@ -2884,6 +2884,7 @@ fn split_runs_by_bg_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::DisplayInlayHintPart;
 
     #[test]
     fn inlay_text_is_injected_without_changing_buffer_length() {

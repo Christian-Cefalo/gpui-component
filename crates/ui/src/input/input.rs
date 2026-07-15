@@ -290,7 +290,11 @@ impl RenderOnce for Input {
         div()
             .id(("input", self.state.entity_id()))
             .flex()
-            .key_context(crate::input::CONTEXT)
+            .key_context(if state.mode.is_code_editor() {
+                "Input mode = code_editor"
+            } else {
+                crate::input::CONTEXT
+            })
             .track_focus(&state.focus_handle.clone())
             .tab_index(self.tab_index)
             .when(!state.disabled, |this| {
@@ -322,6 +326,43 @@ impl RenderOnce for Input {
                         this.on_action(
                             window.listener_for(&self.state, InputState::on_action_go_to_bracket),
                         )
+                        .on_action(
+                            window.listener_for(
+                                &self.state,
+                                InputState::on_action_toggle_line_comment,
+                            ),
+                        )
+                        .on_action(
+                            window.listener_for(
+                                &self.state,
+                                InputState::on_action_toggle_block_comment,
+                            ),
+                        )
+                        .on_action(window.listener_for(&self.state, InputState::on_delete_line))
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_insert_line_above),
+                        )
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_insert_line_below),
+                        )
+                        .on_action(window.listener_for(&self.state, InputState::on_move_line_up))
+                        .on_action(window.listener_for(&self.state, InputState::on_move_line_down))
+                        .on_action(window.listener_for(&self.state, InputState::on_copy_line_up))
+                        .on_action(window.listener_for(&self.state, InputState::on_copy_line_down))
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_duplicate_selection),
+                        )
+                        .on_action(window.listener_for(&self.state, InputState::on_reverse_lines))
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_sort_lines_ascending),
+                        )
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_sort_lines_descending),
+                        )
+                        .on_action(
+                            window.listener_for(&self.state, InputState::on_delete_duplicate_lines),
+                        )
+                        .on_action(window.listener_for(&self.state, InputState::on_join_lines))
                         .on_action(
                             window.listener_for(&self.state, InputState::on_add_next_occurrence),
                         )
@@ -376,6 +417,11 @@ impl RenderOnce for Input {
                     window.listener_for(&self.state, InputState::on_action_open_document_link),
                 );
 
+                let result = result.on_action(window.listener_for(
+                    &self.state,
+                    InputState::on_action_open_document_color_picker,
+                ));
+
                 result
             })
             .on_action(window.listener_for(&self.state, InputState::select_all))
@@ -396,6 +442,7 @@ impl RenderOnce for Input {
             .on_action(window.listener_for(&self.state, InputState::show_character_palette))
             .on_action(window.listener_for(&self.state, InputState::copy))
             .on_action(window.listener_for(&self.state, InputState::on_action_search))
+            .on_action(window.listener_for(&self.state, InputState::on_action_replace))
             .on_key_down(window.listener_for(&self.state, InputState::on_key_down))
             .on_mouse_down(
                 MouseButton::Left,

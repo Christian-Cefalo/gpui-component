@@ -152,6 +152,16 @@ impl EditorLanguageConfiguration {
         &self.surrounding_pairs
     }
 
+    /// The language's line-comment token, such as `//` or `#`.
+    pub fn line_comment(&self) -> Option<&str> {
+        self.line_comment.as_deref()
+    }
+
+    /// The language's block-comment delimiters, such as `/*` and `*/`.
+    pub fn block_comment(&self) -> Option<&EditorCharacterPair> {
+        self.block_comment.as_ref()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.brackets.is_empty()
             && self.auto_closing_pairs.is_empty()

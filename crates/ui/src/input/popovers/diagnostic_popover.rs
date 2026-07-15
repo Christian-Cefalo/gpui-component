@@ -19,12 +19,30 @@ pub struct DiagnosticPopover {
     pub(crate) diagnostic: Rc<DiagnosticEntry>,
     bounds: Bounds<Pixels>,
     open: bool,
+    pinned: bool,
 }
 
 impl DiagnosticPopover {
     pub fn new(
         diagnostic: &DiagnosticEntry,
         state: Entity<InputState>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::new_with_pinned(diagnostic, state, false, cx)
+    }
+
+    pub(crate) fn new_pinned(
+        diagnostic: &DiagnosticEntry,
+        state: Entity<InputState>,
+        cx: &mut App,
+    ) -> Entity<Self> {
+        Self::new_with_pinned(diagnostic, state, true, cx)
+    }
+
+    fn new_with_pinned(
+        diagnostic: &DiagnosticEntry,
+        state: Entity<InputState>,
+        pinned: bool,
         cx: &mut App,
     ) -> Entity<Self> {
         let diagnostic = Rc::new(diagnostic.clone());
@@ -34,7 +52,12 @@ impl DiagnosticPopover {
             state,
             bounds: Bounds::default(),
             open: true,
+            pinned,
         })
+    }
+
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned
     }
 
     pub(crate) fn show(&mut self, cx: &mut Context<Self>) {
@@ -48,7 +71,7 @@ impl DiagnosticPopover {
     }
 
     pub(crate) fn check_to_hide(&mut self, mouse_position: Point<Pixels>, cx: &mut Context<Self>) {
-        if !self.open {
+        if !self.open || self.pinned {
             return;
         }
 

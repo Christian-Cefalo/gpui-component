@@ -80,6 +80,7 @@ pub struct Lsp {
     document_highlights: Vec<lsp_types::DocumentHighlight>,
     document_links: Vec<lsp_types::DocumentLink>,
     active_document_link: Option<lsp_types::DocumentLink>,
+    document_link_tooltip_visible: bool,
     document_link_generation: u64,
     document_link_requested_generation: Option<u64>,
     code_lenses: Vec<lsp_types::CodeLens>,
@@ -149,6 +150,7 @@ impl Default for Lsp {
             document_highlights: vec![],
             document_links: vec![],
             active_document_link: None,
+            document_link_tooltip_visible: false,
             document_link_generation: 0,
             document_link_requested_generation: None,
             code_lenses: vec![],
@@ -223,6 +225,7 @@ impl Lsp {
         self.document_highlights.clear();
         self.document_links.clear();
         self.active_document_link = None;
+        self.document_link_tooltip_visible = false;
         self.document_link_generation = self.document_link_generation.wrapping_add(1);
         self.document_link_requested_generation = None;
         self.code_lenses.clear();
@@ -357,7 +360,7 @@ impl InputState {
         let had_popover = self.hover_popover.is_some();
 
         if event.modifiers.secondary() {
-            if self.handle_hover_document_link(offset) {
+            if self.handle_hover_document_link(offset, true, cx) {
                 self.hover_definition.clear();
             } else {
                 self.handle_hover_definition(offset, window, cx);
@@ -365,7 +368,9 @@ impl InputState {
         } else {
             self.clear_active_document_link();
             self.hover_definition.clear();
-            self.handle_hover_popover(offset, window, cx);
+            if !self.handle_hover_document_link(offset, false, cx) {
+                self.handle_hover_popover(offset, window, cx);
+            }
         }
 
         let changed = had_definition == self.hover_definition.is_empty()
@@ -379,6 +384,7 @@ impl InputState {
     pub(crate) fn clear_hover_state(&mut self, cx: &mut Context<InputState>) {
         self.hover_definition.clear();
         self.clear_active_document_link();
+        self.lsp.document_link_tooltip_visible = false;
         self.clear_active_inlay_hint();
         self.hover_popover = None;
         self.lsp._hover_task = Task::ready(Ok(()));

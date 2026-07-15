@@ -906,7 +906,34 @@ impl InputState {
     /// order.
     pub fn apply_buffer_edits(
         &mut self,
+        edits: Vec<(Range<usize>, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.apply_buffer_edits_internal(edits, None, window, cx)
+    }
+
+    /// Apply edits while installing a caller-computed selection set expressed
+    /// in post-edit UTF-8 byte offsets. This is reserved for editor commands
+    /// whose selection affinity cannot be inferred from ordinary text edits,
+    /// such as keeping a caret inside a newly inserted block-comment pair.
+    pub(super) fn apply_buffer_edits_with_selections(
+        &mut self,
+        edits: Vec<(Range<usize>, String)>,
+        selections_after: Vec<EditorSelection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if selections_after.is_empty() {
+            return false;
+        }
+        self.apply_buffer_edits_internal(edits, Some(selections_after), window, cx)
+    }
+
+    fn apply_buffer_edits_internal(
+        &mut self,
         mut edits: Vec<(Range<usize>, String)>,
+        selections_after: Option<Vec<EditorSelection>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -930,7 +957,8 @@ impl InputState {
         }
 
         let before = self.selections();
-        let mut after = before.clone();
+        let transform_selections = selections_after.is_none();
+        let mut after = selections_after.unwrap_or_else(|| before.clone());
         let was_silent = self.silent_replace_text;
         self.cancel_linked_editing(cx);
         self.secondary_selections.clear();
@@ -940,9 +968,14 @@ impl InputState {
         let history_version = self.history.version();
 
         for (range, text) in edits.into_iter().rev() {
-            for selection in &mut after {
-                *selection =
-                    Self::transform_selection_after_external_edit(*selection, &range, text.len());
+            if transform_selections {
+                for selection in &mut after {
+                    *selection = Self::transform_selection_after_external_edit(
+                        *selection,
+                        &range,
+                        text.len(),
+                    );
+                }
             }
             let range_utf16 = self.range_to_utf16(&range);
             EntityInputHandler::replace_text_in_range(self, Some(range_utf16), &text, window, cx);
@@ -957,13 +990,11 @@ impl InputState {
         self.refresh_bracket_match();
 
         let after = self.selections();
-        if before != after {
-            self.multi_cursor_history
-                .insert(history_version, MultiCursorHistoryEntry { before, after });
-            while self.multi_cursor_history.len() > 1_000 {
-                if let Some(version) = self.multi_cursor_history.keys().next().copied() {
-                    self.multi_cursor_history.remove(&version);
-                }
+        self.multi_cursor_history
+            .insert(history_version, MultiCursorHistoryEntry { before, after });
+        while self.multi_cursor_history.len() > 1_000 {
+            if let Some(version) = self.multi_cursor_history.keys().next().copied() {
+                self.multi_cursor_history.remove(&version);
             }
         }
         if self.emit_events {
@@ -1306,7 +1337,11 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Root, input::Undo, theme::Theme};
+    use crate::{
+        Root,
+        input::{Redo, Undo},
+        theme::Theme,
+    };
     use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 
     struct InputView {
@@ -1433,6 +1468,89 @@ mod tests {
                 vec![2, 5]
             );
             assert!(!state.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn explicit_post_edit_selections_round_trip_through_undo_and_redo(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("x", window, cx);
+                state.set_editor_selections([EditorSelection::from_anchor_and_head(0, 1)], cx);
+                assert!(state.apply_buffer_edits_with_selections(
+                    vec![(0..0, "/* ".to_string()), (1..1, " */".to_string())],
+                    vec![EditorSelection::from_anchor_and_head(3, 4)],
+                    window,
+                    cx,
+                ));
+                assert_eq!(state.value(), "/* x */");
+                assert_eq!(
+                    state.selections(),
+                    vec![EditorSelection::from_anchor_and_head(3, 4)]
+                );
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.undo(&Undo, window, cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "x");
+            assert_eq!(
+                state.selections(),
+                vec![EditorSelection::from_anchor_and_head(0, 1)]
+            );
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.redo(&Redo, window, cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "/* x */");
+            assert_eq!(
+                state.selections(),
+                vec![EditorSelection::from_anchor_and_head(3, 4)]
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn undo_preserves_secondary_cursors_when_external_edits_do_not_move_them(
+        cx: &mut TestAppContext,
+    ) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("aa\nbb", window, cx);
+                state.set_editor_selections(
+                    [EditorSelection::caret(0), EditorSelection::caret(3)],
+                    cx,
+                );
+                assert!(state.apply_buffer_edits(vec![(5..5, "!".to_string())], window, cx,));
+                assert_eq!(state.value(), "aa\nbb!");
+                assert_eq!(
+                    state.selections(),
+                    vec![EditorSelection::caret(0), EditorSelection::caret(3)]
+                );
+            });
+        });
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| state.undo(&Undo, window, cx));
+        });
+        input.read_with(&cx, |state, _| {
+            assert_eq!(state.value(), "aa\nbb");
+            assert_eq!(
+                state.selections(),
+                vec![EditorSelection::caret(0), EditorSelection::caret(3)]
+            );
         });
     }
 

@@ -34,9 +34,9 @@ use super::{
 };
 use crate::Size;
 use crate::actions::{SelectDown, SelectLeft, SelectRight, SelectUp};
-use crate::highlighter::DiagnosticSet;
 #[cfg(not(target_family = "wasm"))]
 use crate::highlighter::LanguageRegistry;
+use crate::highlighter::{Diagnostic, DiagnosticEntry, DiagnosticSet};
 use crate::input::blink_cursor::CURSOR_WIDTH;
 use crate::input::movement::MoveDirection;
 use crate::input::multi_cursor::{MultiCursorDelete, MultiCursorOccurrenceSession};
@@ -136,10 +136,31 @@ actions!(
         TriggerCompletion,
         ToggleCodeActions,
         Search,
+        Replace,
+        ToggleSearchCase,
+        ToggleSearchWholeWord,
+        ToggleSearchRegex,
+        ToggleSearchPreserveCase,
         GoToDefinition,
         OpenDocumentLink,
+        OpenDocumentColorPicker,
         TriggerParameterHints,
         GoToBracket,
+        ToggleLineComment,
+        ToggleBlockComment,
+        DeleteLine,
+        InsertLineAbove,
+        InsertLineBelow,
+        MoveLineUp,
+        MoveLineDown,
+        CopyLineUp,
+        CopyLineDown,
+        DuplicateSelection,
+        ReverseLines,
+        SortLinesAscending,
+        SortLinesDescending,
+        DeleteDuplicateLines,
+        JoinLines,
         StartLinkedEditing,
     ]
 );
@@ -158,6 +179,7 @@ pub enum InputEvent {
 }
 
 pub(super) const CONTEXT: &str = "Input";
+const CODE_EDITOR_CONTEXT: &str = "Input && mode == code_editor";
 
 pub(crate) fn init(cx: &mut App) {
     cx.bind_keys([
@@ -239,13 +261,62 @@ pub(crate) fn init(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-space", TriggerParameterHints, Some(CONTEXT)),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-\\", GoToBracket, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-\\", GoToBracket, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-\\", GoToBracket, Some(CONTEXT)),
+        KeyBinding::new("ctrl-shift-\\", GoToBracket, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-shift-f2", StartLinkedEditing, Some(CONTEXT)),
+        KeyBinding::new("cmd-/", ToggleLineComment, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-shift-f2", StartLinkedEditing, Some(CONTEXT)),
+        KeyBinding::new("ctrl-/", ToggleLineComment, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("shift-alt-a", ToggleBlockComment, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-shift-k", DeleteLine, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-k", DeleteLine, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(
+            "cmd-shift-enter",
+            InsertLineAbove,
+            Some(CODE_EDITOR_CONTEXT),
+        ),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-shift-enter",
+            InsertLineAbove,
+            Some(CODE_EDITOR_CONTEXT),
+        ),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-enter", InsertLineBelow, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-enter", InsertLineBelow, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-up", MoveLineUp, Some(CODE_EDITOR_CONTEXT)),
+        KeyBinding::new("alt-down", MoveLineDown, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new("ctrl-alt-shift-up", CopyLineUp, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "linux")]
+        KeyBinding::new(
+            "ctrl-alt-shift-down",
+            CopyLineDown,
+            Some(CODE_EDITOR_CONTEXT),
+        ),
+        #[cfg(not(target_os = "linux"))]
+        KeyBinding::new("alt-shift-up", CopyLineUp, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "linux"))]
+        KeyBinding::new("alt-shift-down", CopyLineDown, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("ctrl-j", JoinLines, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new(
+            "cmd-shift-f2",
+            StartLinkedEditing,
+            Some(CODE_EDITOR_CONTEXT),
+        ),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new(
+            "ctrl-shift-f2",
+            StartLinkedEditing,
+            Some(CODE_EDITOR_CONTEXT),
+        ),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-]", Indent, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -344,6 +415,14 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-f", Search, Some(CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-f", Search, Some(CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-f", Replace, Some(CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-h", Replace, Some(CONTEXT)),
+        KeyBinding::new("alt-c", ToggleSearchCase, Some("SearchPanel")),
+        KeyBinding::new("alt-w", ToggleSearchWholeWord, Some("SearchPanel")),
+        KeyBinding::new("alt-r", ToggleSearchRegex, Some("SearchPanel")),
+        KeyBinding::new("alt-p", ToggleSearchPreserveCase, Some("SearchPanel")),
     ]);
 
     number_input::init(cx);
@@ -945,6 +1024,43 @@ impl InputState {
     #[inline]
     pub fn diagnostics_mut(&mut self) -> Option<&mut DiagnosticSet> {
         self.mode.diagnostics_mut()
+    }
+
+    /// Show the editor's rich diagnostic popover for an explicit diagnostic.
+    ///
+    /// This is the programmatic counterpart to the existing mouse-hover path
+    /// and is intended for marker navigation such as F8/Shift+F8. The caller
+    /// remains responsible for revealing the diagnostic range first.
+    pub fn show_diagnostic_popover(
+        &mut self,
+        diagnostic: impl Into<Diagnostic>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.mode.is_code_editor() {
+            return false;
+        }
+        let diagnostic = diagnostic.into();
+        let start = self.text.position_to_offset(&diagnostic.range.start);
+        let end = self.text.position_to_offset(&diagnostic.range.end);
+        if end < start {
+            return false;
+        }
+        let diagnostic = DiagnosticEntry {
+            range: start..end,
+            diagnostic,
+        };
+        self.diagnostic_popover = Some(DiagnosticPopover::new_pinned(&diagnostic, cx.entity(), cx));
+        cx.notify();
+        true
+    }
+
+    /// Close a diagnostic popover opened by hover or marker navigation.
+    pub fn hide_diagnostic_popover(&mut self, cx: &mut Context<Self>) -> bool {
+        let was_visible = self.diagnostic_popover.take().is_some();
+        if was_visible {
+            cx.notify();
+        }
+        was_visible
     }
 
     /// Set placeholder
@@ -2087,8 +2203,13 @@ impl InputState {
             let is_enable = !self.disabled;
             let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
             let has_document_link = is_enable && self.has_document_link_at_cursor();
+            let has_document_color = is_enable && self.has_document_color_at_cursor();
             let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
             let has_linked_editing = is_enable && self.lsp.linked_editing_range_provider.is_some();
+            let has_line_comment =
+                is_enable && self.language_configuration.line_comment().is_some();
+            let has_block_comment =
+                is_enable && self.language_configuration.block_comment().is_some();
             let is_selected = self
                 .selections()
                 .iter()
@@ -2102,6 +2223,11 @@ impl InputState {
                         "Open Link",
                         !has_document_link,
                         Box::new(crate::input::OpenDocumentLink),
+                    )
+                    .menu_with_disabled(
+                        "Edit Color...",
+                        !has_document_color,
+                        Box::new(crate::input::OpenDocumentColorPicker),
                     )
                     .menu_with_disabled(
                         rust_i18n::t!("Input.Go to Definition"),
@@ -2118,6 +2244,77 @@ impl InputState {
                         !has_linked_editing,
                         Box::new(crate::input::StartLinkedEditing),
                     )
+                    .menu_with_disabled(
+                        "Toggle Line Comment",
+                        !has_line_comment,
+                        Box::new(crate::input::ToggleLineComment),
+                    )
+                    .menu_with_disabled(
+                        "Toggle Block Comment",
+                        !has_block_comment,
+                        Box::new(crate::input::ToggleBlockComment),
+                    )
+                    .menu_with_disabled(
+                        "Insert Line Above",
+                        !is_enable,
+                        Box::new(crate::input::InsertLineAbove),
+                    )
+                    .menu_with_disabled(
+                        "Insert Line Below",
+                        !is_enable,
+                        Box::new(crate::input::InsertLineBelow),
+                    )
+                    .menu_with_disabled(
+                        "Delete Line",
+                        !is_enable,
+                        Box::new(crate::input::DeleteLine),
+                    )
+                    .menu_with_disabled(
+                        "Move Line Up",
+                        !is_enable,
+                        Box::new(crate::input::MoveLineUp),
+                    )
+                    .menu_with_disabled(
+                        "Move Line Down",
+                        !is_enable,
+                        Box::new(crate::input::MoveLineDown),
+                    )
+                    .menu_with_disabled(
+                        "Copy Line Up",
+                        !is_enable,
+                        Box::new(crate::input::CopyLineUp),
+                    )
+                    .menu_with_disabled(
+                        "Copy Line Down",
+                        !is_enable,
+                        Box::new(crate::input::CopyLineDown),
+                    )
+                    .menu_with_disabled(
+                        "Duplicate Selection",
+                        !is_enable,
+                        Box::new(crate::input::DuplicateSelection),
+                    )
+                    .menu_with_disabled(
+                        "Reverse Lines",
+                        !is_enable,
+                        Box::new(crate::input::ReverseLines),
+                    )
+                    .menu_with_disabled(
+                        "Sort Lines Ascending",
+                        !is_enable,
+                        Box::new(crate::input::SortLinesAscending),
+                    )
+                    .menu_with_disabled(
+                        "Sort Lines Descending",
+                        !is_enable,
+                        Box::new(crate::input::SortLinesDescending),
+                    )
+                    .menu_with_disabled(
+                        "Delete Duplicate Lines",
+                        !is_enable,
+                        Box::new(crate::input::DeleteDuplicateLines),
+                    )
+                    .menu_with_disabled("Join Lines", !is_enable, Box::new(crate::input::JoinLines))
                     .separator();
             }
 
@@ -2269,6 +2466,13 @@ impl InputState {
         self.handle_mouse_move(offset, event, window, cx);
 
         if self.mode.is_code_editor() {
+            if self
+                .diagnostic_popover
+                .as_ref()
+                .is_some_and(|popover| popover.read(cx).is_pinned())
+            {
+                return;
+            }
             if let Some(diagnostic) = self
                 .mode
                 .diagnostics()
@@ -3955,6 +4159,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn diagnostic_popover_can_be_opened_and_closed_programmatically(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("broken", window, cx);
+                let diagnostic = Diagnostic {
+                    range: Position::new(0, 0)..Position::new(0, 6),
+                    message: "example diagnostic".into(),
+                    ..Diagnostic::default()
+                };
+                assert!(state.show_diagnostic_popover(diagnostic, cx));
+                assert!(state.diagnostic_popover.is_some());
+                assert!(
+                    state
+                        .diagnostic_popover
+                        .as_ref()
+                        .is_some_and(|popover| popover.read(cx).is_pinned())
+                );
+                assert!(state.hide_diagnostic_popover(cx));
+                assert!(state.diagnostic_popover.is_none());
+                assert!(!state.hide_diagnostic_popover(cx));
+            });
+        });
+    }
+
+    #[gpui::test]
     fn secondary_enter_submits_multi_line_input_without_inserting_text(cx: &mut TestAppContext) {
         let input_view = InputView::build(cx, |state| state.auto_grow(1, 5));
         let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
@@ -4278,7 +4511,11 @@ mod tests {
                 assert_eq!(state.document_links().len(), 1);
                 state.move_to(2, None, cx);
                 assert!(state.has_document_link_at_cursor());
-                assert!(state.handle_hover_document_link(2));
+                assert!(state.handle_hover_document_link(2, false, cx));
+                assert!(state.hover_popover.is_some());
+                assert!(!state.lsp.has_active_document_link());
+                assert!(state.handle_hover_document_link(2, true, cx));
+                assert!(state.lsp.has_active_document_link());
                 assert!(state.open_document_link_at_cursor(window, cx));
                 assert!(activated.get());
 
