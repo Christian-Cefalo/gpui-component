@@ -43,6 +43,7 @@ pub struct Input {
     cleanable: bool,
     mask_toggle: bool,
     disabled: bool,
+    read_only: bool,
     bordered: bool,
     focus_bordered: bool,
     tab_index: isize,
@@ -86,6 +87,7 @@ impl Input {
             cleanable: false,
             mask_toggle: false,
             disabled: false,
+            read_only: false,
             bordered: true,
             focus_bordered: true,
             tab_index: 0,
@@ -149,6 +151,13 @@ impl Input {
     /// Set to disable the input field.
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// Keep the input selectable, scrollable, searchable, and normally styled
+    /// while preventing user-initiated text mutations.
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -249,6 +258,7 @@ impl RenderOnce for Input {
         self.state.update(cx, |state, _| {
             state.context_menu_builder = self.context_menu_builder.clone();
             state.disabled = self.disabled;
+            state.read_only = self.read_only;
             state.size = self.size;
 
             // Only for single line mode
@@ -282,6 +292,7 @@ impl RenderOnce for Input {
         let suffix = self.suffix;
         let show_clear_button = self.cleanable
             && !state.disabled
+            && !state.read_only
             && !state.loading
             && state.text.len() > 0
             && state.mode.is_single_line();
@@ -297,7 +308,7 @@ impl RenderOnce for Input {
             })
             .track_focus(&state.focus_handle.clone())
             .tab_index(self.tab_index)
-            .when(!state.disabled, |this| {
+            .when(!state.disabled && !state.read_only, |this| {
                 this.on_action(window.listener_for(&self.state, InputState::backspace))
                     .on_action(window.listener_for(&self.state, InputState::delete))
                     .on_action(

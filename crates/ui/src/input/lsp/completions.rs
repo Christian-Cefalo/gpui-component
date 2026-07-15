@@ -308,7 +308,7 @@ impl InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled || self.completion_inserting {
+        if self.disabled || self.read_only || self.completion_inserting {
             return;
         }
         if self.refresh_active_snippet_choice_menu(window, cx) {

@@ -559,6 +559,7 @@ pub struct InputState {
     pub(super) selecting: bool,
     pub(super) size: Size,
     pub(super) disabled: bool,
+    pub(super) read_only: bool,
     pub(super) masked: bool,
     pub(super) clean_on_escape: bool,
     pub(super) submit_on_enter: bool,
@@ -579,6 +580,8 @@ pub struct InputState {
     pub(super) number_min: Option<f64>,
     /// The maximum value for [`super::NumberInput`]. See [`Self::max`].
     pub(super) number_max: Option<f64>,
+    /// One-based source line rendered for the first buffer row.
+    pub(super) line_number_start: usize,
     pub(crate) scroll_handle: ScrollHandle,
     /// The deferred scroll offset to apply on next layout.
     pub(crate) deferred_scroll_offset: Option<Point<Pixels>>,
@@ -709,6 +712,7 @@ impl InputState {
             input_bounds: Bounds::default(),
             selecting: false,
             disabled: false,
+            read_only: false,
             masked: false,
             clean_on_escape: false,
             submit_on_enter: false,
@@ -722,6 +726,7 @@ impl InputState {
             number_step: Some(NumberStep::Fixed(1.)),
             number_min: None,
             number_max: None,
+            line_number_start: 1,
             mode: InputMode::default(),
             last_layout: None,
             last_bounds: None,
@@ -957,6 +962,25 @@ impl InputState {
         cx.notify();
     }
 
+    /// Set the one-based source line rendered for the first buffer row.
+    ///
+    /// This is useful for bounded code previews whose first retained row is a
+    /// slice of a larger document. Values below one are clamped to one.
+    pub fn line_number_start(mut self, start: usize) -> Self {
+        self.line_number_start = start.max(1);
+        self
+    }
+
+    /// Replace the one-based source line rendered for the first buffer row.
+    pub fn set_line_number_start(&mut self, start: usize, cx: &mut Context<Self>) {
+        self.line_number_start = start.max(1);
+        cx.notify();
+    }
+
+    pub(super) fn display_line_number(&self, buffer_line: usize) -> usize {
+        self.line_number_start.saturating_add(buffer_line)
+    }
+
     /// Set the number of rows for the multi-line Textarea.
     ///
     /// This is only used when `multi_line` is set to true.
@@ -1176,12 +1200,15 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let was_disabled = self.disabled;
+        let was_read_only = self.read_only;
         self.disabled = false;
+        self.read_only = false;
         let text: SharedString = text.into();
         let range_utf16 = self.range_to_utf16(&(self.cursor()..self.cursor()));
         self.replace_text_in_range_silent(Some(range_utf16), &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
         self.disabled = was_disabled;
+        self.read_only = was_read_only;
     }
 
     /// Replace text at the current cursor position.
@@ -1194,11 +1221,14 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let was_disabled = self.disabled;
+        let was_read_only = self.read_only;
         self.disabled = false;
+        self.read_only = false;
         let text: SharedString = text.into();
         self.replace_text_in_range_silent(None, &text, window, cx);
         self.selected_range = (self.selected_range.end..self.selected_range.end).into();
         self.disabled = was_disabled;
+        self.read_only = was_read_only;
     }
 
     fn replace_text(
@@ -1208,12 +1238,15 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         let was_disabled = self.disabled;
+        let was_read_only = self.read_only;
         self.disabled = false;
+        self.read_only = false;
         let text: SharedString = text.into();
         let range = 0..self.text.chars().map(|c| c.len_utf16()).sum();
         self.replace_text_in_range_silent(Some(range), &text, window, cx);
         self.reset_highlighter(cx);
         self.disabled = was_disabled;
+        self.read_only = was_read_only;
     }
 
     fn reset_selection(&mut self) {
@@ -1255,6 +1288,12 @@ impl InputState {
     pub(crate) fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
         self
+    }
+
+    /// Return whether the rendered input currently prevents user text edits
+    /// while retaining normal selection, scrolling, search, and styling.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Set with password masked state.
@@ -2205,20 +2244,22 @@ impl InputState {
             }
 
             let is_enable = !self.disabled;
+            let is_editable = is_enable && !self.read_only;
             let has_goto_definition = is_enable && self.lsp.definition_provider.is_some();
             let has_document_link = is_enable && self.has_document_link_at_cursor();
-            let has_document_color = is_enable && self.has_document_color_at_cursor();
-            let has_code_action = is_enable && !self.lsp.code_action_providers.is_empty();
-            let has_linked_editing = is_enable && self.lsp.linked_editing_range_provider.is_some();
+            let has_document_color = is_editable && self.has_document_color_at_cursor();
+            let has_code_action = is_editable && !self.lsp.code_action_providers.is_empty();
+            let has_linked_editing =
+                is_editable && self.lsp.linked_editing_range_provider.is_some();
             let has_line_comment =
-                is_enable && self.language_configuration.line_comment().is_some();
+                is_editable && self.language_configuration.line_comment().is_some();
             let has_block_comment =
-                is_enable && self.language_configuration.block_comment().is_some();
+                is_editable && self.language_configuration.block_comment().is_some();
             let is_selected = self
                 .selections()
                 .iter()
                 .any(|selection| !selection.is_empty());
-            let has_paste = is_enable && cx.read_from_clipboard().is_some();
+            let has_paste = is_editable && cx.read_from_clipboard().is_some();
 
             let mut menu = NativeMenu::new();
             if is_code_editor {
@@ -2260,71 +2301,75 @@ impl InputState {
                     )
                     .menu_with_disabled(
                         "Insert Line Above",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::InsertLineAbove),
                     )
                     .menu_with_disabled(
                         "Insert Line Below",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::InsertLineBelow),
                     )
                     .menu_with_disabled(
                         "Delete Line",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::DeleteLine),
                     )
                     .menu_with_disabled(
                         "Move Line Up",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::MoveLineUp),
                     )
                     .menu_with_disabled(
                         "Move Line Down",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::MoveLineDown),
                     )
                     .menu_with_disabled(
                         "Copy Line Up",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::CopyLineUp),
                     )
                     .menu_with_disabled(
                         "Copy Line Down",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::CopyLineDown),
                     )
                     .menu_with_disabled(
                         "Duplicate Selection",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::DuplicateSelection),
                     )
                     .menu_with_disabled(
                         "Reverse Lines",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::ReverseLines),
                     )
                     .menu_with_disabled(
                         "Sort Lines Ascending",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::SortLinesAscending),
                     )
                     .menu_with_disabled(
                         "Sort Lines Descending",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::SortLinesDescending),
                     )
                     .menu_with_disabled(
                         "Delete Duplicate Lines",
-                        !is_enable,
+                        !is_editable,
                         Box::new(crate::input::DeleteDuplicateLines),
                     )
-                    .menu_with_disabled("Join Lines", !is_enable, Box::new(crate::input::JoinLines))
+                    .menu_with_disabled(
+                        "Join Lines",
+                        !is_editable,
+                        Box::new(crate::input::JoinLines),
+                    )
                     .separator();
             }
 
             menu.menu_with_disabled(
                 rust_i18n::t!("Input.Cut"),
-                !(is_enable && is_selected),
+                !(is_editable && is_selected),
                 Box::new(crate::input::Cut),
             )
             .menu_with_disabled(
@@ -3679,7 +3724,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if self.disabled || self.read_only {
             return;
         }
 
@@ -3887,7 +3932,7 @@ impl EntityInputHandler for InputState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.disabled {
+        if self.disabled || self.read_only {
             return;
         }
 
@@ -4160,6 +4205,32 @@ mod tests {
                 window_handle: window,
             }
         }
+    }
+
+    #[gpui::test]
+    fn read_only_blocks_user_edits_but_allows_host_refreshes(cx: &mut TestAppContext) {
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value("alpha", window, cx);
+                state.read_only = true;
+                state.replace_text_in_range(None, "blocked", window, cx);
+                assert_eq!(state.value(), "alpha");
+
+                state.set_value("refreshed", window, cx);
+                assert_eq!(state.value(), "refreshed");
+                assert!(state.is_read_only());
+
+                state.set_line_number_start(41, cx);
+                assert_eq!(state.display_line_number(0), 41);
+                assert_eq!(state.display_line_number(9), 50);
+                state.set_line_number_start(0, cx);
+                assert_eq!(state.display_line_number(0), 1);
+            });
+        });
     }
 
     #[gpui::test]

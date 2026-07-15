@@ -143,6 +143,7 @@ impl InputState {
         cx: &mut Context<Self>,
     ) {
         if self.disabled
+            || self.read_only
             || !self.mode.is_code_editor()
             || self.lsp.code_action_providers.is_empty()
             || !self.focus_handle.is_focused(window)
