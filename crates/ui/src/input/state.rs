@@ -2152,6 +2152,10 @@ impl InputState {
             return;
         }
 
+        if self.hide_hover_popover(cx) {
+            return;
+        }
+
         if self.cancel_linked_editing(cx) {
             return;
         }
@@ -4224,7 +4228,7 @@ mod tests {
             input.update(cx, |state, cx| {
                 assert!(state.show_hover_at_cursor(window, cx));
                 assert_eq!(calls.get(), 1, "the visible cursor hover is reused");
-                assert!(state.hide_hover_popover(cx));
+                state.escape(&Escape, window, cx);
                 assert!(state.hover_popover_snapshot(cx).is_none());
                 assert!(!state.hide_hover_popover(cx));
             });
