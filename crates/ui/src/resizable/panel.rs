@@ -431,8 +431,7 @@ impl Element for ResizePanelGroupElement {
                             window,
                             cx,
                         ),
-                    }
-                    cx.notify();
+                    };
                 })
             }
         });

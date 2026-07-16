@@ -256,70 +256,111 @@ impl ResizableState {
         size: Pixels,
         _: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
+        // Only resize the left panels.
+        if ix >= self.sizes.len().saturating_sub(1) {
+            return false;
+        }
+        self.sync_real_panel_sizes(cx);
         let old_sizes = self.sizes.clone();
 
-        let mut ix = ix;
-        // Only resize the left panels.
-        if ix >= old_sizes.len() - 1 {
-            return;
-        }
-        let container_size = self.container_size();
-        self.sync_real_panel_sizes(cx);
+        let Some(new_sizes) = self.resized_panel_sizes(ix, size, &old_sizes) else {
+            return false;
+        };
 
-        let move_changed = size - old_sizes[ix];
-        if move_changed == px(0.) {
-            return;
-        }
-
-        let size_range = self.panel_size_range(ix);
-        let new_size = size.clamp(size_range.start, size_range.end);
-        let is_expand = move_changed > px(0.);
-
-        let main_ix = ix;
-        let mut new_sizes = old_sizes.clone();
-
-        if is_expand {
-            let mut changed = new_size - old_sizes[ix];
-            new_sizes[ix] = new_size;
-
-            while changed > px(0.) && ix < old_sizes.len() - 1 {
-                ix += 1;
-                let size_range = self.panel_size_range(ix);
-                let available_size = (new_sizes[ix] - size_range.start).max(px(0.));
-                let to_reduce = changed.min(available_size);
-                new_sizes[ix] -= to_reduce;
-                changed -= to_reduce;
-            }
-        } else {
-            let mut changed = new_size - size;
-            new_sizes[ix] = new_size;
-
-            while changed > px(0.) && ix > 0 {
-                ix -= 1;
-                let size_range = self.panel_size_range(ix);
-                let available_size = (new_sizes[ix] - size_range.start).max(px(0.));
-                let to_reduce = changed.min(available_size);
-                changed -= to_reduce;
-                new_sizes[ix] -= to_reduce;
-            }
-
-            new_sizes[main_ix + 1] += old_sizes[main_ix] - size - changed;
-        }
-
-        // If total size exceeds container size, adjust the main panel
-        let total_size: Pixels = new_sizes.iter().map(|s| s.as_f32()).sum::<f32>().into();
-        if total_size > container_size {
-            let overflow = total_size - container_size;
-            new_sizes[main_ix] = (new_sizes[main_ix] - overflow).max(size_range.start);
-        }
-
-        for (i, _) in old_sizes.iter().enumerate() {
-            let size = new_sizes[i];
-            self.panels[i].size = Some(size);
+        for (panel, size) in self.panels.iter_mut().zip(new_sizes.iter().copied()) {
+            panel.size = Some(size);
         }
         self.sizes = new_sizes;
         cx.notify();
+        true
+    }
+
+    /// Calculate a drag result while honoring both sides of the handle.
+    ///
+    /// The panel under the pointer can consume space only while the panels on
+    /// the other side can release it, and vice versa. In particular, an
+    /// expanding sibling's maximum is a hard stop. Returning `None` when the
+    /// drag is already pinned at a constraint prevents redundant repaint work
+    /// for every pointer event beyond that boundary.
+    fn resized_panel_sizes(
+        &self,
+        ix: usize,
+        requested_size: Pixels,
+        old_sizes: &[Pixels],
+    ) -> Option<Vec<Pixels>> {
+        if ix >= old_sizes.len().saturating_sub(1) {
+            return None;
+        }
+
+        let current_size = old_sizes[ix];
+        if requested_size == current_size {
+            return None;
+        }
+
+        let mut new_sizes = old_sizes.to_vec();
+        if requested_size > current_size {
+            let requested_growth = requested_size - current_size;
+            let main_capacity = (self.panel_size_range(ix).end - current_size).max(px(0.));
+            let release_capacity = ((ix + 1)..old_sizes.len()).fold(px(0.), |total, panel_ix| {
+                total + (old_sizes[panel_ix] - self.panel_size_range(panel_ix).start).max(px(0.))
+            });
+            let mut remaining = requested_growth.min(main_capacity).min(release_capacity);
+            if remaining == px(0.) {
+                return None;
+            }
+
+            let growth = remaining;
+            new_sizes[ix] += growth;
+            for panel_ix in (ix + 1)..old_sizes.len() {
+                let available =
+                    (old_sizes[panel_ix] - self.panel_size_range(panel_ix).start).max(px(0.));
+                let released = remaining.min(available);
+                new_sizes[panel_ix] -= released;
+                remaining -= released;
+                if remaining == px(0.) {
+                    break;
+                }
+            }
+        } else {
+            let requested_shrink = current_size - requested_size;
+            let release_capacity = (0..=ix).rev().fold(px(0.), |total, panel_ix| {
+                total + (old_sizes[panel_ix] - self.panel_size_range(panel_ix).start).max(px(0.))
+            });
+            let growth_capacity = ((ix + 1)..old_sizes.len()).fold(px(0.), |total, panel_ix| {
+                total + (self.panel_size_range(panel_ix).end - old_sizes[panel_ix]).max(px(0.))
+            });
+            let mut remaining = requested_shrink.min(release_capacity).min(growth_capacity);
+            if remaining == px(0.) {
+                return None;
+            }
+
+            let shrink = remaining;
+            for panel_ix in (0..=ix).rev() {
+                let available =
+                    (old_sizes[panel_ix] - self.panel_size_range(panel_ix).start).max(px(0.));
+                let released = remaining.min(available);
+                new_sizes[panel_ix] -= released;
+                remaining -= released;
+                if remaining == px(0.) {
+                    break;
+                }
+            }
+
+            let mut remaining = shrink;
+            for panel_ix in (ix + 1)..old_sizes.len() {
+                let available =
+                    (self.panel_size_range(panel_ix).end - old_sizes[panel_ix]).max(px(0.));
+                let accepted = remaining.min(available);
+                new_sizes[panel_ix] += accepted;
+                remaining -= accepted;
+                if remaining == px(0.) {
+                    break;
+                }
+            }
+        }
+
+        (new_sizes != old_sizes).then_some(new_sizes)
     }
 
     /// Adjust panel sizes according to the container size.
@@ -396,5 +437,58 @@ mod tests {
 
         assert!(state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
         assert!(!state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
+    }
+
+    #[test]
+    fn resize_stops_when_expanding_sibling_reaches_its_maximum() {
+        let state = ResizableState {
+            axis: Axis::Vertical,
+            panels: vec![
+                ResizablePanelState {
+                    size_range: px(120.)..Pixels::MAX,
+                    ..Default::default()
+                },
+                ResizablePanelState {
+                    size_range: px(104.)..px(420.),
+                    ..Default::default()
+                },
+            ],
+            sizes: vec![px(615.), px(280.)],
+            ..ResizableState::default()
+        };
+
+        let resized = state
+            .resized_panel_sizes(0, px(330.), &state.sizes)
+            .expect("the dock can still grow to its maximum");
+        assert_eq!(resized, vec![px(475.), px(420.)]);
+        assert!(state.resized_panel_sizes(0, px(300.), &resized).is_none());
+    }
+
+    #[test]
+    fn resize_distributes_growth_without_exceeding_later_panel_maximums() {
+        let state = ResizableState {
+            axis: Axis::Vertical,
+            panels: vec![
+                ResizablePanelState {
+                    size_range: px(100.)..Pixels::MAX,
+                    ..Default::default()
+                },
+                ResizablePanelState {
+                    size_range: px(100.)..px(250.),
+                    ..Default::default()
+                },
+                ResizablePanelState {
+                    size_range: px(100.)..px(200.),
+                    ..Default::default()
+                },
+            ],
+            sizes: vec![px(300.), px(200.), px(100.)],
+            ..ResizableState::default()
+        };
+
+        let resized = state
+            .resized_panel_sizes(0, px(100.), &state.sizes)
+            .expect("later panels can accept 150 pixels");
+        assert_eq!(resized, vec![px(150.), px(250.), px(200.)]);
     }
 }
