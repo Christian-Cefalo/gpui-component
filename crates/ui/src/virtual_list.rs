@@ -115,8 +115,7 @@ impl VirtualListScrollHandle {
 
     /// Scrolls to the bottom of the list.
     pub fn scroll_to_bottom(&self) {
-        let items_count = self.state.borrow().items_count;
-        self.scroll_to_item(items_count.saturating_sub(1), ScrollStrategy::Top);
+        self.scroll_to_item(usize::MAX, ScrollStrategy::Top);
     }
 }
 
@@ -249,8 +248,13 @@ impl VirtualList {
         content_bounds: &Bounds<Pixels>,
         scroll_to_item: DeferredScrollToItem,
     ) -> Point<Pixels> {
+        let item_index = if scroll_to_item.item_index == usize::MAX {
+            items_bounds.len().saturating_sub(1)
+        } else {
+            scroll_to_item.item_index
+        };
         let Some(bounds) = items_bounds
-            .get(scroll_to_item.item_index + scroll_to_item.offset)
+            .get(item_index.saturating_add(scroll_to_item.offset))
             .cloned()
         else {
             return scroll_offset;
@@ -748,5 +752,27 @@ impl Element for VirtualList {
                 }
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scroll_to_bottom_does_not_depend_on_the_previous_frame_item_count() {
+        let handle = VirtualListScrollHandle::new();
+
+        handle.scroll_to_bottom();
+
+        assert_eq!(
+            handle
+                .state
+                .borrow()
+                .deferred_scroll_to_item
+                .as_ref()
+                .map(|scroll| scroll.item_index),
+            Some(usize::MAX)
+        );
     }
 }
