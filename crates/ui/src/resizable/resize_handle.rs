@@ -1,12 +1,12 @@
 use std::{cell::Cell, rc::Rc};
 
 use gpui::{
-    div, prelude::FluentBuilder as _, px, AnyElement, App, Axis, Element, ElementId, Entity,
-    GlobalElementId, InteractiveElement, IntoElement, MouseDownEvent, MouseUpEvent,
-    ParentElement as _, Pixels, Point, Render, StatefulInteractiveElement, Styled as _, Window,
+    AnyElement, App, Axis, Element, ElementId, Entity, GlobalElementId, InteractiveElement,
+    IntoElement, MouseDownEvent, MouseUpEvent, ParentElement as _, Pixels, Point, Render,
+    StatefulInteractiveElement, Styled as _, Window, div, prelude::FluentBuilder as _, px,
 };
 
-use crate::{dock::DockPlacement, ActiveTheme as _, AxisExt as _};
+use crate::{ActiveTheme as _, AxisExt as _, dock::DockPlacement};
 
 pub(crate) const HANDLE_PADDING: Pixels = px(4.);
 pub(crate) const HANDLE_SIZE: Pixels = px(1.);
@@ -25,6 +25,7 @@ pub(crate) struct ResizeHandle<T: 'static, E: 'static + Render> {
     drag_value: Option<Rc<T>>,
     placement: Option<DockPlacement>,
     on_drag: Option<Rc<dyn Fn(&Point<Pixels>, &mut Window, &mut App) -> Entity<E>>>,
+    on_resize_start: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
 }
 
 impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
@@ -36,6 +37,7 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
             drag_value: None,
             placement: None,
             axis,
+            on_resize_start: None,
         }
     }
 
@@ -54,6 +56,14 @@ impl<T: 'static, E: 'static + Render> ResizeHandle<T, E> {
 
     pub(crate) fn placement(mut self, placement: DockPlacement) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    pub(crate) fn on_resize_start(
+        mut self,
+        callback: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_resize_start = Some(Rc::new(callback));
         self
     }
 }
@@ -193,12 +203,16 @@ impl<T: 'static, E: 'static + Render> Element for ResizeHandle<T, E> {
 
         window.with_element_state(id.unwrap(), |state: Option<ResizeHandleState>, window| {
             let state = state.unwrap_or(ResizeHandleState::default());
+            let on_resize_start = self.on_resize_start.clone();
 
             window.on_mouse_event({
                 let state = state.clone();
-                move |ev: &MouseDownEvent, phase, window, _| {
+                move |ev: &MouseDownEvent, phase, window, cx| {
                     if bounds.contains(&ev.position) && phase.bubble() {
                         state.set_active(true);
+                        if let Some(callback) = &on_resize_start {
+                            callback(window, cx);
+                        }
                         window.refresh();
                     }
                 }

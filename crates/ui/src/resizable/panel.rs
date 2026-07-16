@@ -183,6 +183,7 @@ impl RenderOnce for ResizablePanelGroup {
                         panel.panel_ix = ix;
                         panel.axis = self.axis;
                         panel.state = Some(state.clone());
+                        panel.deferred_resize = self.deferred_resize;
                         panel
                     }),
             )
@@ -248,6 +249,7 @@ pub struct ResizablePanel {
     size_range: Range<Pixels>,
     children: Vec<AnyElement>,
     visible: bool,
+    deferred_resize: bool,
     style: StyleRefinement,
 }
 
@@ -262,6 +264,7 @@ impl ResizablePanel {
             axis: Axis::Horizontal,
             children: vec![],
             visible: true,
+            deferred_resize: false,
             style: StyleRefinement::default(),
         }
     }
@@ -370,17 +373,25 @@ impl RenderOnce for ResizablePanel {
             .children(self.children)
             .when(self.panel_ix > 0, |this| {
                 let ix = self.panel_ix - 1;
-                this.child(resize_handle(("resizable-handle", ix), self.axis).on_drag(
-                    drag_panel,
-                    move |drag_panel, _, _, cx| {
+                let handle =
+                    resize_handle::<DragPanel, DragPanel>(("resizable-handle", ix), self.axis);
+                let handle = if self.deferred_resize {
+                    handle.on_resize_start(move |_, cx| {
+                        state.update(cx, |state, _| {
+                            state.resizing_panel_ix = Some(ix);
+                        });
+                    })
+                } else {
+                    handle.on_drag(drag_panel, move |drag_panel, _, _, cx| {
                         cx.stop_propagation();
                         // Set current resizing panel ix
                         state.update(cx, |state, _| {
                             state.resizing_panel_ix = Some(ix);
                         });
                         cx.new(|_| drag_panel.deref().clone())
-                    },
-                ))
+                    })
+                };
+                this.child(handle)
             })
     }
 }
@@ -496,6 +507,8 @@ mod tests {
     #[test]
     fn deferred_pointer_resize_flushes_once_on_mouse_up() {
         let source = include_str!("panel.rs");
+        assert!(source.contains("if self.deferred_resize"));
+        assert!(source.contains("handle.on_resize_start"));
         assert!(source.contains("if deferred_resize"));
         assert!(source.contains("state.queue_resize_panel_at_handle(ix, requested_size)"));
         assert!(source.contains("state.flush_queued_resize(window, cx)"));
