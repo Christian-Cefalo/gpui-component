@@ -157,17 +157,38 @@ impl ResizableState {
         size_range: Range<Pixels>,
         cx: &mut Context<Self>,
     ) {
+        if !self.sync_panel_geometry(panel_ix, bounds, size_range) {
+            return;
+        }
+        cx.notify();
+    }
+
+    fn sync_panel_geometry(
+        &mut self,
+        panel_ix: usize,
+        bounds: Bounds<Pixels>,
+        size_range: Range<Pixels>,
+    ) -> bool {
         let size = bounds.size.along(self.axis);
         // This check is only necessary to stop the very first panel from resizing on its own
         // it needs to be passed when the panel is freshly created so we get the initial size,
         // but its also fine when it sometimes passes later.
-        if self.sizes[panel_ix].as_f32() == PANEL_MIN_SIZE.as_f32() {
+        let seeds_initial_size = self.sizes[panel_ix].as_f32() == PANEL_MIN_SIZE.as_f32()
+            && (self.sizes[panel_ix] != size || self.panels[panel_ix].size != Some(size));
+        let geometry_changed = seeds_initial_size
+            || self.panels[panel_ix].bounds != bounds
+            || self.panels[panel_ix].size_range != size_range;
+        if !geometry_changed {
+            return false;
+        }
+
+        if seeds_initial_size {
             self.sizes[panel_ix] = size;
             self.panels[panel_ix].size = Some(size);
         }
         self.panels[panel_ix].bounds = bounds;
         self.panels[panel_ix].size_range = size_range;
-        cx.notify();
+        true
     }
 
     pub(crate) fn remove_panel(&mut self, panel_ix: usize, cx: &mut Context<Self>) {
@@ -335,4 +356,45 @@ pub(crate) struct ResizablePanelState {
     pub size: Option<Pixels>,
     pub size_range: Range<Pixels>,
     bounds: Bounds<Pixels>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{point, size};
+
+    fn one_panel_state() -> ResizableState {
+        ResizableState {
+            axis: Axis::Vertical,
+            panels: vec![ResizablePanelState::default()],
+            sizes: vec![PANEL_MIN_SIZE],
+            ..ResizableState::default()
+        }
+    }
+
+    #[test]
+    fn stable_panel_geometry_is_a_noop_after_initial_measurement() {
+        let mut state = one_panel_state();
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(640.), px(240.)));
+        let range = px(120.)..px(480.);
+
+        assert!(state.sync_panel_geometry(0, bounds, range.clone()));
+        assert_eq!(state.sizes, vec![px(240.)]);
+        assert!(!state.sync_panel_geometry(0, bounds, range));
+    }
+
+    #[test]
+    fn panel_geometry_changes_only_when_bounds_or_constraints_change() {
+        let mut state = one_panel_state();
+        let bounds = Bounds::new(point(px(0.), px(0.)), size(px(640.), px(240.)));
+        let range = px(120.)..px(480.);
+        assert!(state.sync_panel_geometry(0, bounds, range.clone()));
+
+        let moved = Bounds::new(point(px(0.), px(12.)), size(px(640.), px(240.)));
+        assert!(state.sync_panel_geometry(0, moved, range.clone()));
+        assert!(!state.sync_panel_geometry(0, moved, range.clone()));
+
+        assert!(state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
+        assert!(!state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
+    }
 }
