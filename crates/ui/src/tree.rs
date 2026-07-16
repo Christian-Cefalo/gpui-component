@@ -3,7 +3,7 @@ use std::{cell::RefCell, ops::Range, rc::Rc};
 use gpui::{
     App, Context, ElementId, Entity, EventEmitter, FocusHandle, InteractiveElement as _,
     IntoElement, KeyBinding, ListSizingBehavior, MouseButton, ParentElement, Render, RenderOnce,
-    SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
+    ScrollHandle, SharedString, StyleRefinement, Styled, UniformListScrollHandle, Window, div,
     prelude::FluentBuilder as _, uniform_list,
 };
 
@@ -73,6 +73,7 @@ pub struct TreeItem {
 pub struct TreeEntry {
     item: TreeItem,
     depth: usize,
+    is_folder: bool,
 }
 
 impl TreeEntry {
@@ -96,7 +97,7 @@ impl TreeEntry {
     /// Whether this item is a folder (has children).
     #[inline]
     pub fn is_folder(&self) -> bool {
-        self.item.is_folder()
+        self.is_folder
     }
 
     /// Return true if the item is expanded.
@@ -121,6 +122,15 @@ pub enum TreeEvent {
 }
 
 impl TreeItem {
+    fn shallow_clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            children: Vec::new(),
+            state: self.state.clone(),
+        }
+    }
+
     /// Create a new tree item with the given label.
     ///
     /// - The `id` for you to uniquely identify this item, then later you can use it for selection or other purposes.
@@ -203,6 +213,7 @@ impl TreeItem {
 /// State for managing tree items.
 pub struct TreeState {
     focus_handle: FocusHandle,
+    items: Vec<TreeItem>,
     entries: Vec<TreeEntry>,
     scroll_handle: UniformListScrollHandle,
     selected_ix: Option<usize>,
@@ -219,6 +230,7 @@ impl TreeState {
     /// Create a new empty tree state.
     pub fn new(cx: &mut App) -> Self {
         Self {
+            items: Vec::new(),
             selected_ix: None,
             right_clicked_ix: None,
             focus_handle: cx.focus_handle(),
@@ -231,21 +243,15 @@ impl TreeState {
 
     /// Set the tree items.
     pub fn items(mut self, items: impl Into<Vec<TreeItem>>) -> Self {
-        let items = items.into();
-        self.entries.clear();
-        for item in items.into_iter() {
-            self.add_entry(item, 0);
-        }
+        self.items = items.into();
+        self.rebuild_entries();
         self
     }
 
     /// Set the tree items.
     pub fn set_items(&mut self, items: impl Into<Vec<TreeItem>>, cx: &mut Context<Self>) {
-        let items = items.into();
-        self.entries.clear();
-        for item in items.into_iter() {
-            self.add_entry(item, 0);
-        }
+        self.items = items.into();
+        self.rebuild_entries();
         self.selected_ix = None;
         self.right_clicked_ix = None;
         cx.notify();
@@ -294,6 +300,14 @@ impl TreeState {
         self.scroll_handle.scroll_to_item(ix, strategy);
     }
 
+    /// Returns the base scroll handle used by the virtualized tree viewport.
+    ///
+    /// This allows a containing scroll surface to hand wheel input off at the
+    /// tree's boundaries instead of permanently trapping it in the tree.
+    pub fn scroll_handle(&self) -> ScrollHandle {
+        self.scroll_handle.0.borrow().base_handle.clone()
+    }
+
     /// Get the currently selected entry, if any.
     pub fn selected_entry(&self) -> Option<&TreeEntry> {
         self.selected_ix.and_then(|ix| self.entries.get(ix))
@@ -302,8 +316,8 @@ impl TreeState {
     fn expand_ancestors(&mut self, target_id: SharedString, cx: &mut Context<Self>) {
         let mut ancestors = Vec::new();
 
-        for entry in &self.entries {
-            if let Some(found_ancestors) = entry.item.find_ancestors(&target_id) {
+        for item in &self.items {
+            if let Some(found_ancestors) = item.find_ancestors(&target_id) {
                 ancestors = found_ancestors;
                 break;
             }
@@ -321,18 +335,6 @@ impl TreeState {
         }
 
         self.rebuild_entries();
-    }
-
-    fn add_entry(&mut self, item: TreeItem, depth: usize) {
-        self.entries.push(TreeEntry {
-            item: item.clone(),
-            depth,
-        });
-        if item.is_expanded() {
-            for child in &item.children {
-                self.add_entry(child.clone(), depth + 1);
-            }
-        }
     }
 
     fn toggle_expand(&mut self, ix: usize, cx: &mut Context<Self>) {
@@ -358,15 +360,23 @@ impl TreeState {
     }
 
     fn rebuild_entries(&mut self) {
-        let root_items: Vec<TreeItem> = self
-            .entries
-            .iter()
-            .filter(|e| e.is_root())
-            .map(|e| e.item.clone())
-            .collect();
         self.entries.clear();
-        for item in root_items.into_iter() {
-            self.add_entry(item, 0);
+
+        fn flatten(item: &TreeItem, depth: usize, entries: &mut Vec<TreeEntry>) {
+            entries.push(TreeEntry {
+                item: item.shallow_clone(),
+                depth,
+                is_folder: item.is_folder(),
+            });
+            if item.is_expanded() {
+                for child in &item.children {
+                    flatten(child, depth + 1, entries);
+                }
+            }
+        }
+
+        for item in &self.items {
+            flatten(item, 0, &mut self.entries);
         }
     }
 
@@ -705,6 +715,8 @@ mod tests {
             assert_eq!(entry.is_root(), true);
             assert_eq!(entry.is_folder(), true);
             assert_eq!(entry.is_expanded(), true);
+            assert!(entry.item().children.is_empty());
+            assert_eq!(state.items[0].children.len(), 2);
 
             let entry = state.entries.get(1).unwrap();
             assert_eq!(entry.depth(), 1);
