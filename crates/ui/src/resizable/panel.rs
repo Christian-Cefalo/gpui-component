@@ -430,7 +430,11 @@ impl Element for ResizePanelGroupElement {
                             state.flush_queued_resize(window, cx);
                         });
                     });
-                    window.request_animation_frame();
+                    // Mouse callbacks do not have a current rendered view, so
+                    // request_animation_frame would panic here. A window refresh
+                    // safely schedules the frame whose completion flushes the
+                    // latest queued pointer position.
+                    window.refresh();
                 }
             }
         });
@@ -453,5 +457,17 @@ impl Element for ResizePanelGroupElement {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn pointer_resize_uses_event_safe_frame_scheduling() {
+        let source = include_str!("panel.rs");
+        assert!(source.contains("window.on_next_frame"));
+        assert!(source.contains("window.refresh();"));
+        let forbidden = ["window.", "request_animation_frame();"].concat();
+        assert!(!source.contains(&forbidden));
     }
 }
