@@ -35,7 +35,6 @@ pub struct ResizableState {
     sizes: Vec<Pixels>,
     pub(crate) resizing_panel_ix: Option<usize>,
     pending_resize: Option<(usize, Pixels)>,
-    resize_frame_pending: bool,
     bounds: Bounds<Pixels>,
 }
 
@@ -47,7 +46,6 @@ impl Default for ResizableState {
             sizes: vec![],
             resizing_panel_ix: None,
             pending_resize: None,
-            resize_frame_pending: false,
             bounds: Bounds::default(),
         }
     }
@@ -243,20 +241,15 @@ impl ResizableState {
         cx.emit(ResizablePanelEvent::Resized);
     }
 
-    /// Keep only the newest pointer position until the next animation frame.
-    /// Returns true when the caller must schedule the frame that will flush it.
-    pub(crate) fn queue_resize_panel_at_handle(&mut self, ix: usize, size: Pixels) -> bool {
+    /// Keep only the newest pointer position for a deferred resize.
+    ///
+    /// The final position is applied on mouse-up so expensive descendants are
+    /// laid out once rather than once for every pointer event.
+    pub(crate) fn queue_resize_panel_at_handle(&mut self, ix: usize, size: Pixels) {
         self.pending_resize = Some((ix, size));
-        if self.resize_frame_pending {
-            false
-        } else {
-            self.resize_frame_pending = true;
-            true
-        }
     }
 
     fn take_queued_resize(&mut self) -> Option<(usize, Pixels)> {
-        self.resize_frame_pending = false;
         self.pending_resize.take()
     }
 
@@ -547,14 +540,15 @@ mod tests {
     }
 
     #[test]
-    fn pointer_resize_queue_coalesces_to_the_latest_position_per_frame() {
+    fn deferred_pointer_resize_keeps_only_the_latest_position_until_release() {
         let mut state = ResizableState::default();
 
-        assert!(state.queue_resize_panel_at_handle(0, px(180.)));
-        assert!(!state.queue_resize_panel_at_handle(0, px(220.)));
-        assert!(!state.queue_resize_panel_at_handle(0, px(260.)));
+        state.queue_resize_panel_at_handle(0, px(180.));
+        state.queue_resize_panel_at_handle(0, px(220.));
+        state.queue_resize_panel_at_handle(0, px(260.));
         assert_eq!(state.take_queued_resize(), Some((0, px(260.))));
         assert!(state.take_queued_resize().is_none());
-        assert!(state.queue_resize_panel_at_handle(0, px(300.)));
+        state.queue_resize_panel_at_handle(0, px(300.));
+        assert_eq!(state.take_queued_resize(), Some((0, px(300.))));
     }
 }

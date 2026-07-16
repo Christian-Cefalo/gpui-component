@@ -4,27 +4,47 @@ use std::{
 };
 
 use gpui::{
-    Along, AnyElement, App, AppContext, Axis, Bounds, Context, Element, ElementId, Empty, Entity,
+    Along, AnyElement, App, AppContext, Axis, Bounds, Context, Element, ElementId, Entity,
     EventEmitter, InteractiveElement as _, IntoElement, IsZero as _, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Render, RenderOnce, Style, StyleRefinement, Styled, Window, div,
     prelude::FluentBuilder,
 };
 
 use crate::{
-    AxisExt, ElementExt, h_flex, resizable::PANEL_MIN_SIZE, styled::StyledExt as _, v_flex,
+    ActiveTheme as _, AxisExt, ElementExt, h_flex, resizable::PANEL_MIN_SIZE,
+    styled::StyledExt as _, v_flex,
 };
 
-use super::{ResizableState, resizable_panel, resize_handle};
+use super::{HANDLE_PADDING, HANDLE_SIZE, ResizableState, resizable_panel, resize_handle};
 
 pub enum ResizablePanelEvent {
     Resized,
 }
 
 #[derive(Clone)]
-pub(crate) struct DragPanel;
+pub(crate) struct DragPanel {
+    axis: Axis,
+    cross_size: Pixels,
+}
+
 impl Render for DragPanel {
-    fn render(&mut self, _: &mut Window, _: &mut Context<'_, Self>) -> impl IntoElement {
-        Empty
+    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let preview_thickness = HANDLE_PADDING * 2. + HANDLE_SIZE;
+        div()
+            .when(self.axis.is_vertical(), |this| {
+                this.v_flex()
+                    .justify_center()
+                    .w(self.cross_size)
+                    .h(preview_thickness)
+                    .child(div().w_full().h(HANDLE_SIZE).bg(cx.theme().drag_border))
+            })
+            .when(self.axis.is_horizontal(), |this| {
+                this.h_flex()
+                    .justify_center()
+                    .w(preview_thickness)
+                    .h(self.cross_size)
+                    .child(div().w(HANDLE_SIZE).h_full().bg(cx.theme().drag_border))
+            })
     }
 }
 
@@ -37,6 +57,7 @@ pub struct ResizablePanelGroup {
     size: Option<Pixels>,
     children: Vec<ResizablePanel>,
     on_resize: Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>,
+    deferred_resize: bool,
 }
 
 impl ResizablePanelGroup {
@@ -49,6 +70,7 @@ impl ResizablePanelGroup {
             state: None,
             size: None,
             on_resize: Rc::new(|_, _, _| {}),
+            deferred_resize: false,
         }
     }
 
@@ -104,6 +126,14 @@ impl ResizablePanelGroup {
         on_resize: impl Fn(&Entity<ResizableState>, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_resize = Rc::new(on_resize);
+        self
+    }
+
+    /// Preview the handle while dragging and apply the panel layout once on
+    /// mouse-up. This is useful when panel descendants are expensive to lay
+    /// out on every pointer event.
+    pub fn deferred_resize(mut self, deferred: bool) -> Self {
+        self.deferred_resize = deferred;
         self
     }
 }
@@ -175,6 +205,7 @@ impl RenderOnce for ResizablePanelGroup {
                 state: state.clone(),
                 axis: self.axis,
                 on_resize: self.on_resize.clone(),
+                deferred_resize: self.deferred_resize,
             })
     }
 }
@@ -283,6 +314,13 @@ impl RenderOnce for ResizablePanel {
             .get(self.panel_ix)
             .expect("BUG: The `index` of ResizablePanel should be one of in `state`.");
         let size_range = self.size_range.clone();
+        let drag_panel = DragPanel {
+            axis: self.axis,
+            cross_size: match self.axis {
+                Axis::Horizontal => state.read(cx).bounds.size.height,
+                Axis::Vertical => state.read(cx).bounds.size.width,
+            },
+        };
 
         div()
             .id(("resizable-panel", self.panel_ix))
@@ -333,7 +371,7 @@ impl RenderOnce for ResizablePanel {
             .when(self.panel_ix > 0, |this| {
                 let ix = self.panel_ix - 1;
                 this.child(resize_handle(("resizable-handle", ix), self.axis).on_drag(
-                    DragPanel,
+                    drag_panel,
                     move |drag_panel, _, _, cx| {
                         cx.stop_propagation();
                         // Set current resizing panel ix
@@ -351,6 +389,7 @@ struct ResizePanelGroupElement {
     state: Entity<ResizableState>,
     on_resize: Rc<dyn Fn(&Entity<ResizableState>, &mut Window, &mut App)>,
     axis: Axis,
+    deferred_resize: bool,
 }
 
 impl IntoElement for ResizePanelGroupElement {
@@ -408,6 +447,7 @@ impl Element for ResizePanelGroupElement {
         window.on_mouse_event({
             let state = self.state.clone();
             let axis = self.axis;
+            let deferred_resize = self.deferred_resize;
             let current_ix = state.read(cx).resizing_panel_ix;
             move |e: &MouseMoveEvent, phase, window, cx| {
                 if !phase.bubble() {
@@ -415,27 +455,18 @@ impl Element for ResizePanelGroupElement {
                 }
                 let Some(ix) = current_ix else { return };
 
-                let should_schedule = state.update(cx, |state, _| {
+                state.update(cx, |state, cx| {
                     let panel = state.panels.get(ix).expect("BUG: invalid panel index");
                     let requested_size = match axis {
                         Axis::Horizontal => e.position.x - panel.bounds.left(),
                         Axis::Vertical => e.position.y - panel.bounds.top(),
                     };
-                    state.queue_resize_panel_at_handle(ix, requested_size)
+                    if deferred_resize {
+                        state.queue_resize_panel_at_handle(ix, requested_size);
+                    } else {
+                        state.resize_panel_at_handle(ix, requested_size, window, cx);
+                    }
                 });
-                if should_schedule {
-                    let state = state.clone();
-                    window.on_next_frame(move |window, cx| {
-                        state.update(cx, |state, cx| {
-                            state.flush_queued_resize(window, cx);
-                        });
-                    });
-                    // Mouse callbacks do not have a current rendered view, so
-                    // request_animation_frame would panic here. A window refresh
-                    // safely schedules the frame whose completion flushes the
-                    // latest queued pointer position.
-                    window.refresh();
-                }
             }
         });
 
@@ -463,11 +494,12 @@ impl Element for ResizePanelGroupElement {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn pointer_resize_uses_event_safe_frame_scheduling() {
+    fn deferred_pointer_resize_flushes_once_on_mouse_up() {
         let source = include_str!("panel.rs");
-        assert!(source.contains("window.on_next_frame"));
-        assert!(source.contains("window.refresh();"));
-        let forbidden = ["window.", "request_animation_frame();"].concat();
+        assert!(source.contains("if deferred_resize"));
+        assert!(source.contains("state.queue_resize_panel_at_handle(ix, requested_size)"));
+        assert!(source.contains("state.flush_queued_resize(window, cx)"));
+        let forbidden = ["window.", "on_next_frame"].concat();
         assert!(!source.contains(&forbidden));
     }
 }
