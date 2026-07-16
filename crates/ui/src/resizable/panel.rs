@@ -415,24 +415,23 @@ impl Element for ResizePanelGroupElement {
                 }
                 let Some(ix) = current_ix else { return };
 
-                state.update(cx, |state, cx| {
+                let should_schedule = state.update(cx, |state, _| {
                     let panel = state.panels.get(ix).expect("BUG: invalid panel index");
-
-                    match axis {
-                        Axis::Horizontal => state.resize_panel_at_handle(
-                            ix,
-                            e.position.x - panel.bounds.left(),
-                            window,
-                            cx,
-                        ),
-                        Axis::Vertical => state.resize_panel_at_handle(
-                            ix,
-                            e.position.y - panel.bounds.top(),
-                            window,
-                            cx,
-                        ),
+                    let requested_size = match axis {
+                        Axis::Horizontal => e.position.x - panel.bounds.left(),
+                        Axis::Vertical => e.position.y - panel.bounds.top(),
                     };
-                })
+                    state.queue_resize_panel_at_handle(ix, requested_size)
+                });
+                if should_schedule {
+                    let state = state.clone();
+                    window.on_next_frame(move |window, cx| {
+                        state.update(cx, |state, cx| {
+                            state.flush_queued_resize(window, cx);
+                        });
+                    });
+                    window.request_animation_frame();
+                }
             }
         });
 
@@ -446,7 +445,10 @@ impl Element for ResizePanelGroupElement {
                     return;
                 }
                 if phase.bubble() {
-                    state.update(cx, |state, cx| state.done_resizing(cx));
+                    state.update(cx, |state, cx| {
+                        state.flush_queued_resize(window, cx);
+                        state.done_resizing(cx);
+                    });
                     on_resize(&state, window, cx);
                 }
             }

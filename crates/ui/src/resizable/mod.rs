@@ -34,6 +34,8 @@ pub struct ResizableState {
     panels: Vec<ResizablePanelState>,
     sizes: Vec<Pixels>,
     pub(crate) resizing_panel_ix: Option<usize>,
+    pending_resize: Option<(usize, Pixels)>,
+    resize_frame_pending: bool,
     bounds: Bounds<Pixels>,
 }
 
@@ -44,6 +46,8 @@ impl Default for ResizableState {
             panels: vec![],
             sizes: vec![],
             resizing_panel_ix: None,
+            pending_resize: None,
+            resize_frame_pending: false,
             bounds: Bounds::default(),
         }
     }
@@ -228,6 +232,34 @@ impl ResizableState {
     pub(crate) fn done_resizing(&mut self, cx: &mut Context<Self>) {
         self.resizing_panel_ix = None;
         cx.emit(ResizablePanelEvent::Resized);
+    }
+
+    /// Keep only the newest pointer position until the next animation frame.
+    /// Returns true when the caller must schedule the frame that will flush it.
+    pub(crate) fn queue_resize_panel_at_handle(&mut self, ix: usize, size: Pixels) -> bool {
+        self.pending_resize = Some((ix, size));
+        if self.resize_frame_pending {
+            false
+        } else {
+            self.resize_frame_pending = true;
+            true
+        }
+    }
+
+    fn take_queued_resize(&mut self) -> Option<(usize, Pixels)> {
+        self.resize_frame_pending = false;
+        self.pending_resize.take()
+    }
+
+    pub(crate) fn flush_queued_resize(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((ix, size)) = self.take_queued_resize() else {
+            return false;
+        };
+        self.resize_panel_at_handle(ix, size, window, cx)
     }
 
     fn panel_size_range(&self, ix: usize) -> Range<Pixels> {
@@ -490,5 +522,17 @@ mod tests {
             .resized_panel_sizes(0, px(100.), &state.sizes)
             .expect("later panels can accept 150 pixels");
         assert_eq!(resized, vec![px(150.), px(250.), px(200.)]);
+    }
+
+    #[test]
+    fn pointer_resize_queue_coalesces_to_the_latest_position_per_frame() {
+        let mut state = ResizableState::default();
+
+        assert!(state.queue_resize_panel_at_handle(0, px(180.)));
+        assert!(!state.queue_resize_panel_at_handle(0, px(220.)));
+        assert!(!state.queue_resize_panel_at_handle(0, px(260.)));
+        assert_eq!(state.take_queued_resize(), Some((0, px(260.))));
+        assert!(state.take_queued_resize().is_none());
+        assert!(state.queue_resize_panel_at_handle(0, px(300.)));
     }
 }
