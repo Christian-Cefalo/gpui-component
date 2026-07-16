@@ -145,10 +145,25 @@ impl DisplayMap {
         self.fold_map.is_fold_candidate(start_line)
     }
 
+    /// Get every current fold candidate.
+    #[inline]
+    pub fn fold_candidates(&self) -> &[FoldRange] {
+        self.fold_map.fold_candidates()
+    }
+
     /// Get all currently folded ranges
     #[inline]
     pub fn folded_ranges(&self) -> &[FoldRange] {
         self.fold_map.folded_ranges()
+    }
+
+    /// Fold or unfold every current candidate as one projection rebuild.
+    pub fn set_all_folded(&mut self, folded: bool) -> bool {
+        if !self.fold_map.set_all_folded(folded) {
+            return false;
+        }
+        self.rebuild_fold_projection();
+        true
     }
 
     /// Clear all folds

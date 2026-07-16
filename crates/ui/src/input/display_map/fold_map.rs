@@ -188,10 +188,30 @@ impl FoldMap {
         &self.folded
     }
 
+    /// Fold or unfold every current candidate as one projection update.
+    pub fn set_all_folded(&mut self, folded: bool) -> bool {
+        let changed = if folded {
+            self.folded != self.candidates
+        } else {
+            !self.folded.is_empty()
+        };
+        if !changed {
+            return false;
+        }
+
+        if folded {
+            self.folded.clone_from(&self.candidates);
+        } else {
+            self.folded.clear();
+        }
+        self.needs_rebuild = true;
+        true
+    }
+
     /// Clear all folds
     #[inline]
     pub fn clear_folds(&mut self) {
-        self.folded.clear();
+        self.set_all_folded(false);
     }
 
     /// Adjust folds and candidates after a text edit.

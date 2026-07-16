@@ -8,6 +8,7 @@ mod comment;
 mod cursor;
 mod display_map;
 mod element;
+mod folding;
 mod indent;
 mod input;
 mod line_operations;
@@ -34,6 +35,7 @@ pub use cursor::*;
 #[cfg(target_family = "wasm")]
 pub use display_map::folding::Tree;
 pub use display_map::{BufferPoint, DisplayMap, DisplayPoint, FoldRange};
+pub use folding::*;
 pub use indent::TabSize;
 pub use input::*;
 pub use lsp::*;

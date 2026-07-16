@@ -425,6 +425,12 @@ impl RenderOnce for Input {
                         window.listener_for(&self.state, InputState::on_action_toggle_code_actions),
                     )
             })
+            .when(!state.disabled && state.mode.is_code_editor(), |this| {
+                this.on_action(window.listener_for(&self.state, InputState::on_action_fold))
+                    .on_action(window.listener_for(&self.state, InputState::on_action_unfold))
+                    .on_action(window.listener_for(&self.state, InputState::on_action_fold_all))
+                    .on_action(window.listener_for(&self.state, InputState::on_action_unfold_all))
+            })
             .on_action(window.listener_for(&self.state, InputState::left))
             .on_action(window.listener_for(&self.state, InputState::right))
             .on_action(window.listener_for(&self.state, InputState::select_left))

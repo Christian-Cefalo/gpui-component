@@ -146,6 +146,10 @@ actions!(
         OpenDocumentColorPicker,
         TriggerParameterHints,
         GoToBracket,
+        Fold,
+        Unfold,
+        FoldAll,
+        UnfoldAll,
         ToggleLineComment,
         ToggleBlockComment,
         DeleteLine,
@@ -264,6 +268,22 @@ pub(crate) fn init(cx: &mut App) {
         KeyBinding::new("cmd-shift-\\", GoToBracket, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("ctrl-shift-\\", GoToBracket, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-[", Fold, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-[", Fold, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-alt-]", Unfold, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-shift-]", Unfold, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k cmd-0", FoldAll, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-k ctrl-0", FoldAll, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-k cmd-j", UnfoldAll, Some(CODE_EDITOR_CONTEXT)),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-k ctrl-j", UnfoldAll, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-/", ToggleLineComment, Some(CODE_EDITOR_CONTEXT)),
         #[cfg(not(target_os = "macos"))]
@@ -2260,6 +2280,7 @@ impl InputState {
                 is_editable && self.language_configuration.line_comment().is_some();
             let has_block_comment =
                 is_editable && self.language_configuration.block_comment().is_some();
+            let folding = self.folding_snapshot();
             let is_selected = self
                 .selections()
                 .iter()
@@ -2293,6 +2314,31 @@ impl InputState {
                         "Start Linked Editing",
                         !has_linked_editing,
                         Box::new(crate::input::StartLinkedEditing),
+                    )
+                    .submenu(
+                        "Folding",
+                        NativeMenu::new()
+                            .menu_with_disabled(
+                                "Fold",
+                                !folding.can_fold,
+                                Box::new(crate::input::Fold),
+                            )
+                            .menu_with_disabled(
+                                "Unfold",
+                                !folding.can_unfold,
+                                Box::new(crate::input::Unfold),
+                            )
+                            .separator()
+                            .menu_with_disabled(
+                                "Fold All",
+                                !folding.can_fold_all,
+                                Box::new(crate::input::FoldAll),
+                            )
+                            .menu_with_disabled(
+                                "Unfold All",
+                                !folding.can_unfold_all,
+                                Box::new(crate::input::UnfoldAll),
+                            ),
                     )
                     .menu_with_disabled(
                         "Toggle Line Comment",
@@ -3037,7 +3083,7 @@ impl InputState {
 
     /// If offset falls on a hidden (folded) line, clamp backward to the end of
     /// the fold header line (last visible position before the fold).
-    fn clamp_offset_to_visible_backward(&self, offset: usize) -> usize {
+    pub(super) fn clamp_offset_to_visible_backward(&self, offset: usize) -> usize {
         let line = self.text.offset_to_point(offset).row;
         if self.display_map.is_buffer_line_hidden(line) {
             for fold in self.display_map.folded_ranges() {
@@ -5502,6 +5548,66 @@ ORDER BY id
              Before: {:?}\nAfter: {:?}",
             colored_before, colored_after
         );
+    }
+
+    #[gpui::test]
+    fn folding_commands_walk_nested_ranges_and_work_read_only(cx: &mut TestAppContext) {
+        use crate::input::display_map::FoldRange;
+
+        let input_view = InputView::new(cx);
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.set_value(
+                    "outer\nline 1\ninner\nline 3\nline 4\ninner end\nline 6\nline 7\nline 8\nouter end\n",
+                    window,
+                    cx,
+                );
+                state.display_map.set_fold_candidates(vec![
+                    FoldRange::new(0, 9),
+                    FoldRange::new(2, 5),
+                ]);
+                state.read_only = true;
+
+                let line_three = state.text.line_start_offset(3);
+                state.move_to(line_three, None, cx);
+                assert!(state.folding_snapshot().can_fold);
+                assert!(state.fold_at_selections(cx));
+                assert_eq!(
+                    state.display_map.folded_ranges(),
+                    &[FoldRange::new(2, 5)]
+                );
+                assert_eq!(state.cursor(), state.text.line_end_offset(2));
+
+                assert!(state.fold_at_selections(cx));
+                assert_eq!(
+                    state.display_map.folded_ranges(),
+                    &[FoldRange::new(0, 9), FoldRange::new(2, 5)]
+                );
+                assert_eq!(state.cursor(), state.text.line_end_offset(0));
+
+                assert!(state.unfold_at_selections(cx));
+                assert_eq!(
+                    state.display_map.folded_ranges(),
+                    &[FoldRange::new(2, 5)]
+                );
+
+                let inner_header = state.text.line_end_offset(2);
+                state.move_to(inner_header, None, cx);
+                assert!(state.unfold_at_selections(cx));
+                assert!(state.display_map.folded_ranges().is_empty());
+
+                assert!(state.fold_all(cx));
+                let snapshot = state.folding_snapshot();
+                assert_eq!(snapshot.candidate_count, 2);
+                assert_eq!(snapshot.folded_count, 2);
+                assert!(snapshot.can_unfold_all);
+                assert!(state.unfold_all(cx));
+                assert!(!state.unfold_all(cx), "repeating Unfold All is a no-op");
+            });
+        });
     }
 
     /// Regression test: `scroll_to` at end-of-buffer must produce a deferred
