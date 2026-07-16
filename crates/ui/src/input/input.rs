@@ -53,6 +53,11 @@ pub struct Input {
     ///
     /// If set, this overrides the built-in context menu.
     context_menu_builder: Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+
+    /// An optional builder that appends host actions after the built-in (or
+    /// explicitly replaced) context menu.
+    context_menu_extension_builder:
+        Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
 }
 
 impl Sizable for Input {
@@ -93,6 +98,7 @@ impl Input {
             tab_index: 0,
             selected: false,
             context_menu_builder: None,
+            context_menu_extension_builder: None,
         }
     }
 
@@ -178,6 +184,19 @@ impl Input {
         self
     }
 
+    /// Extends the right-click context menu without replacing the input's
+    /// built-in editing and language-service actions.
+    ///
+    /// The builder receives the complete menu and may append items, separators,
+    /// or submenus. It runs after [`Self::context_menu`] when both are set.
+    pub fn extend_context_menu(
+        mut self,
+        f: impl Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu + 'static,
+    ) -> Self {
+        self.context_menu_extension_builder = Some(Rc::new(f));
+        self
+    }
+
     fn render_toggle_mask_button(state: &Entity<InputState>, cx: &App) -> impl IntoElement {
         let masked = state.read(cx).masked;
         Button::new("toggle-mask")
@@ -257,6 +276,7 @@ impl RenderOnce for Input {
 
         self.state.update(cx, |state, _| {
             state.context_menu_builder = self.context_menu_builder.clone();
+            state.context_menu_extension_builder = self.context_menu_extension_builder.clone();
             state.disabled = self.disabled;
             state.read_only = self.read_only;
             state.size = self.size;

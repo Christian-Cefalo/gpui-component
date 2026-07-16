@@ -610,6 +610,10 @@ pub struct InputState {
     pub(super) context_menu_builder:
         Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
 
+    /// Optional host extension applied after the built-in or replacement menu.
+    pub(super) context_menu_extension_builder:
+        Option<Rc<dyn Fn(NativeMenu, &mut Window, &mut App) -> NativeMenu>>,
+
     /// Whether the context menu that shows on right-click is enabled.
     ///
     /// This value is ignored if a context menu builder is defined in [`Self::context_menu_builder`].
@@ -751,6 +755,7 @@ impl InputState {
             diagnostic_popover: None,
             context_menu_content: None,
             context_menu_builder: None,
+            context_menu_extension_builder: None,
             enable_context_menu: true,
             completion_inserting: false,
             snippet_variable_context: SnippetVariableContext::default(),
@@ -2387,6 +2392,11 @@ impl InputState {
                 rust_i18n::t!("Input.Select All"),
                 Box::new(crate::input::SelectAll),
             )
+        };
+        let menu = if let Some(builder) = self.context_menu_extension_builder.clone() {
+            builder(menu, window, cx)
+        } else {
+            menu
         };
 
         menu.show(event.position, window, cx);
