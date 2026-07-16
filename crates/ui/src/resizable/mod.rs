@@ -59,6 +59,15 @@ impl ResizableState {
         &self.sizes
     }
 
+    /// Get the last painted bounds for a panel.
+    ///
+    /// This lets automation and accessibility tooling locate a resize handle
+    /// without duplicating the panel group's layout math. A handle at index
+    /// `ix - 1` lies on the leading edge of panel `ix`.
+    pub fn panel_bounds(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        self.panels.get(ix).map(|panel| panel.bounds)
+    }
+
     /// Programmatically resize the panel at `ix` to `size`, redistributing
     /// space among siblings using the same logic as a drag.
     ///
@@ -469,6 +478,19 @@ mod tests {
 
         assert!(state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
         assert!(!state.sync_panel_geometry(0, moved, px(100.)..px(520.)));
+    }
+
+    #[test]
+    fn panel_bounds_exposes_the_last_painted_geometry() {
+        let mut state = one_panel_state();
+        let bounds = Bounds::new(point(px(8.), px(12.)), size(px(640.), px(240.)));
+
+        assert!(state.panel_bounds(0).is_some());
+        assert_ne!(state.panel_bounds(0), Some(bounds));
+        state.sync_panel_geometry(0, bounds, px(120.)..px(480.));
+
+        assert_eq!(state.panel_bounds(0), Some(bounds));
+        assert_eq!(state.panel_bounds(1), None);
     }
 
     #[test]
